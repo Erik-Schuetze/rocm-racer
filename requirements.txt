@@ -1,0 +1,20 @@
+# rocm-racer dependencies
+#
+# PyTorch must be installed manually with ROCm support BEFORE the other
+# packages, because stable-baselines3 will otherwise pull in the CPU build:
+#
+#   pip install torch torchvision torchaudio \
+#     --index-url https://download.pytorch.org/whl/rocm6.3
+#
+# Verify ROCm is detected after install:
+#   python -c "import torch; print(torch.cuda.is_available())"  # should print True
+
+# RL framework
+stable-baselines3>=2.3.0
+gymnasium>=0.29.0
+
+# Numerical
+numpy>=1.26.0
+
+# Linux virtual input device (virtual gamepad — requires /dev/uinput access)
+evdev>=1.7.0

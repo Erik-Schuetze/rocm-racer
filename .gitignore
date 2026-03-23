@@ -1,0 +1,28 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environment / secrets
+.env
+
+# Game ISOs and zip archives (large, copyrighted — do not commit)
+iso/*.iso
+iso/*.zip
+iso/*.gz
+
+# Trained model output and game save files
+saves/
+models/
+
+# Logs and tensorboard runs
+logs/
+runs/
+
+# PCSX2 controller db is written at runtime by main.py — no need to track
+# ~/.config/PCSX2/game_controller_db.txt
