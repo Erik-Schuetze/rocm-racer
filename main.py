@@ -377,9 +377,10 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
         # --- Display results ---
         print(f"\n[calibrate] ── Results ({'top 20' if len(scored) > 20 else 'all'}) ──")
         print(f"  {'Score':>5}  {'Speed Addr':>14}  {'Struct Base':>14}  "
-              f"{'Speed':>8}  {'RPM':>8}  {'Gear':>4}  {'Pos X':>10}")
-        print(f"  {'─' * 5}  {'─' * 14}  {'─' * 14}  {'─' * 8}  {'─' * 8}  {'─' * 4}  {'─' * 10}")
+              f"{'Speed':>8}  {'RPM':>8}  {'Gear':>4}  {'Pos X':>10}  Speed Samples")
+        print(f"  {'─' * 5}  {'─' * 14}  {'─' * 14}  {'─' * 8}  {'─' * 8}  {'─' * 4}  {'─' * 10}  {'─' * 30}")
         for entry in scored[:20]:
+            samples_str = " → ".join(f"{v:.1f}" for v in entry.get("speed_samples", []))
             print(
                 f"  {entry['score']:5d}  "
                 f"0x{entry['speed_addr']:08X}  "
@@ -387,14 +388,15 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 f"{entry['speed_ms']:8.2f}  "
                 f"{entry['rpm']:8.0f}  "
                 f"{entry['gear']:4d}  "
-                f"{entry['pos_x']:10.2f}"
+                f"{entry['pos_x']:10.2f}  "
+                f"{samples_str}"
             )
 
         best = scored[0]
         if best["score"] >= 5:
             struct_addr = best["struct_base"]
             print(f"\n[calibrate] ✓ Best match: vehicle struct @ PS2 0x{struct_addr:08X} "
-                  f"(score {best['score']}/7)")
+                  f"(score {best['score']}/8)")
 
             # Save to calibration file
             CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -403,7 +405,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             print(f"[calibrate] Saved to {CALIBRATION_FILE}")
             print(f"[calibrate] Use with:  python main.py --telemetry")
         else:
-            print(f"\n[calibrate] ⚠ No high-confidence match (best score: {best['score']}/7).")
+            print(f"\n[calibrate] ⚠ No high-confidence match (best score: {best['score']}/8).")
             print("[calibrate] Try running calibration again, or use --snap/--scan-diff manually.")
 
     finally:
@@ -419,72 +421,80 @@ def _score_candidates(
     candidates: list[int],
     gamepad: "VirtualGamepad",
 ) -> list[dict]:
-    """Score candidate speed addresses with a live driving verification.
+    """Score candidate speed addresses with temporal live-driving verification.
 
-    Takes two readings — one while stopped, one while accelerating —
-    and checks that the candidate's struct fields behave like a real
-    vehicle (position changes, speed is realistic, RPM climbs, gear > 0).
+    Takes multiple readings over time while accelerating and checks that
+    the candidate's speed actually changes (not a constant like gravity).
 
     Returns a list of dicts sorted by score (descending).
     """
     import math
     from evdev import ecodes as e
 
-    # --- Read 1: car should be stopped right now ---
-    stopped_reads: dict[int, dict] = {}
+    addr_list = []
     for speed_addr in candidates:
         struct_base = speed_addr - 0x24
-        if struct_base < 0:
-            continue
+        if struct_base >= 0:
+            addr_list.append((speed_addr, struct_base))
+
+    # --- Read while stopped ---
+    print("[calibrate] Verification: reading while stopped...")
+    stopped: dict[int, dict] = {}
+    for speed_addr, base in addr_list:
         try:
-            stopped_reads[speed_addr] = {
-                "struct_base": struct_base,
+            stopped[speed_addr] = {
                 "speed": reader._read_f32(speed_addr),
-                "pos_x": reader._read_f32(struct_base + 0x00),
-                "pos_y": reader._read_f32(struct_base + 0x04),
-                "pos_z": reader._read_f32(struct_base + 0x08),
-                "vel_x": reader._read_f32(struct_base + 0x10),
-                "rpm": reader._read_f32(struct_base + 0x1A4),
-                "gear": reader._read_i32(struct_base + 0x1B0),
+                "pos_x": reader._read_f32(base + 0x00),
+                "pos_y": reader._read_f32(base + 0x04),
+                "pos_z": reader._read_f32(base + 0x08),
             }
         except (RuntimeError, OSError):
             continue
 
-    # --- Accelerate for 2s then read again ---
-    print("[calibrate] Verification: accelerating for 2s...")
+    # --- Accelerate and take 3 speed samples over 3s ---
+    print("[calibrate] Verification: accelerating for 3s (3 samples)...")
     gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
-    time.sleep(2.0)
 
-    moving_reads: dict[int, dict] = {}
-    for speed_addr in stopped_reads:
-        struct_base = stopped_reads[speed_addr]["struct_base"]
+    speed_samples: dict[int, list[float]] = {a: [] for a in stopped}
+    for _ in range(3):
+        time.sleep(1.0)
+        for speed_addr in stopped:
+            try:
+                speed_samples[speed_addr].append(reader._read_f32(speed_addr))
+            except (RuntimeError, OSError):
+                speed_samples[speed_addr].append(float("nan"))
+
+    # --- Final moving read (full struct) ---
+    moving: dict[int, dict] = {}
+    for speed_addr, base in addr_list:
+        if speed_addr not in stopped:
+            continue
         try:
-            moving_reads[speed_addr] = {
+            moving[speed_addr] = {
                 "speed": reader._read_f32(speed_addr),
-                "pos_x": reader._read_f32(struct_base + 0x00),
-                "pos_y": reader._read_f32(struct_base + 0x04),
-                "pos_z": reader._read_f32(struct_base + 0x08),
-                "vel_x": reader._read_f32(struct_base + 0x10),
-                "rpm": reader._read_f32(struct_base + 0x1A4),
-                "gear": reader._read_i32(struct_base + 0x1B0),
+                "pos_x": reader._read_f32(base + 0x00),
+                "pos_y": reader._read_f32(base + 0x04),
+                "pos_z": reader._read_f32(base + 0x08),
+                "rpm": reader._read_f32(base + 0x1A4),
+                "gear": reader._read_i32(base + 0x1B0),
             }
         except (RuntimeError, OSError):
             continue
 
     gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-    # --- Score each candidate ---
+    # --- Score ---
     results = []
-    for speed_addr, stopped in stopped_reads.items():
-        moving = moving_reads.get(speed_addr)
-        if moving is None:
+    for speed_addr, base in addr_list:
+        s = stopped.get(speed_addr)
+        m = moving.get(speed_addr)
+        if s is None or m is None:
             continue
 
-        struct_base = stopped["struct_base"]
         score = 0
-
-        s_spd = stopped["speed"]
-        m_spd = moving["speed"]
+        s_spd = s["speed"]
+        m_spd = m["speed"]
+        samples = speed_samples.get(speed_addr, [])
 
         # 1. Speed near zero when stopped (< 1 m/s)
         if math.isfinite(s_spd) and 0.0 <= s_spd < 1.0:
@@ -494,34 +504,41 @@ def _score_candidates(
         if math.isfinite(m_spd) and 1.0 <= m_spd <= 100.0:
             score += 1
 
-        # 3. Position changed between stopped and moving
-        s_pos = (stopped["pos_x"], stopped["pos_y"], stopped["pos_z"])
-        m_pos = (moving["pos_x"], moving["pos_y"], moving["pos_z"])
+        # 3. Speed CHANGED over time (not a constant like gravity)
+        #    Check that samples are mostly increasing and distinct
+        finite_samples = [v for v in samples if math.isfinite(v)]
+        if len(finite_samples) >= 2:
+            spread = max(finite_samples) - min(finite_samples)
+            if spread > 0.5:  # speed changed by at least 0.5 m/s
+                score += 2  # strong signal — eliminates constants
+                # Bonus: monotonically increasing (accelerating)
+                if all(b >= a - 0.1 for a, b in zip(finite_samples, finite_samples[1:])):
+                    score += 1
+
+        # 4. Position changed between stopped and moving
+        s_pos = (s["pos_x"], s["pos_y"], s["pos_z"])
+        m_pos = (m["pos_x"], m["pos_y"], m["pos_z"])
         if all(math.isfinite(v) for v in s_pos + m_pos):
             dist_sq = sum((a - b) ** 2 for a, b in zip(s_pos, m_pos))
-            if dist_sq > 1.0:  # moved at least 1 metre
-                score += 2  # strong signal
+            if dist_sq > 1.0:
+                score += 1
 
-        # 4. RPM in engine range while moving (500–15000)
-        m_rpm = moving["rpm"]
+        # 5. RPM in engine range while moving (500–15000)
+        m_rpm = m["rpm"]
         if math.isfinite(m_rpm) and 500.0 <= m_rpm <= 15000.0:
             score += 1
 
-        # 5. Gear is a small positive integer while moving
-        m_gear = moving["gear"]
+        # 6. Gear is a small positive integer while moving
+        m_gear = m["gear"]
         if 1 <= m_gear <= 6:
-            score += 1
-
-        # 6. Velocity non-zero while moving
-        m_vel = moving["vel_x"]
-        if math.isfinite(m_vel) and abs(m_vel) > 0.1:
             score += 1
 
         results.append({
             "speed_addr": speed_addr,
-            "struct_base": struct_base,
+            "struct_base": base,
             "score": score,
             "speed_ms": m_spd,
+            "speed_samples": finite_samples,
             "pos_x": m_pos[0],
             "rpm": m_rpm,
             "gear": m_gear,
