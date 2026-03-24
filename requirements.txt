@@ -12,6 +12,7 @@
 # RL framework
 stable-baselines3>=2.3.0
 gymnasium>=0.29.0
+tensorboard>=2.14.0
 
 # Numerical
 numpy>=1.26.0
