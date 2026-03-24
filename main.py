@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Project paths
 # ---------------------------------------------------------------------------
@@ -201,27 +203,23 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
-    """Automated vehicle struct discovery via differential memory scanning.
+    """Automated vehicle struct discovery via structural fingerprinting.
 
-    Launches PCSX2, uses the virtual gamepad to alternate between braking
-    (car stopped) and accelerating (car moving), takes EE RAM snapshots
-    at each state, and narrows candidates using differential scans.
-    Finally, auto-verifies surviving candidates by reading adjacent
-    struct fields.
+    Uses 16-byte alignment constraints, quaternion validation, and
+    multi-field pattern matching to find the player vehicle struct in
+    the 32 MB EE RAM.  Then discovers a static pointer so the calibration
+    survives across savestate reloads.
     """
     import math
     from memory_readers.nfsu2_memory import NFSU2MemoryReader, TelemetryOffsets
     from memory_readers.virtual_gamepad import VirtualGamepad
     from evdev import ecodes as e
 
-    BRAKE_TIME = 1.5     # seconds to hold brake (decelerate, not reverse)
-    COAST_TIME = 6.0     # seconds to wait with no input for car to reach 0
     ACCEL_TIME = 3.0     # seconds to hold accelerate
-    MAX_CYCLES = 5       # max accel/brake narrowing cycles
-    TARGET_CANDIDATES = 50  # stop narrowing when we reach this many
+    STRUCT_MIN_SIZE = 0x168  # bytes — must cover through gear at 0x164
 
     print("[rocm-racer] ══════════════════════════════════════════════")
-    print("[rocm-racer]  Calibration mode — automated struct finder  ")
+    print("[rocm-racer]  Calibration — structural fingerprint scanner ")
     print("[rocm-racer] ══════════════════════════════════════════════")
 
     # --- Setup: gamepad + PCSX2 ---
@@ -235,157 +233,94 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     reader = NFSU2MemoryReader(offsets=offsets)
     reader.open()
 
-    candidates: list[int] | None = None
-
-    def _stop_car() -> None:
-        """Brake via analog stick then coast to a full stop."""
-        gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
-        time.sleep(BRAKE_TIME)
-        gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-        time.sleep(COAST_TIME)
-
     try:
-        # Car is already stopped from savestate — take initial stopped snapshot
-        print("\n[calibrate] Snapshot (stopped — from savestate)...")
+        # ── Phase 1: stationary structural fingerprint ──
+        print("\n[calibrate] Phase 1: scanning stationary fingerprint (car must be stopped)...")
         snap_stopped = reader.snapshot_ee_ram()
-        time.sleep(1.0)
-        snap_stopped_2 = reader.snapshot_ee_ram()
-
-        results = NFSU2MemoryReader.diff_scan(
-            snap_stopped, snap_stopped_2, "unchanged", candidates
-        )
-        prev_count = len(candidates) if candidates else "all"
-        candidates = [addr for addr, _, _ in results]
-        print(f"[calibrate] Filter 'unchanged@stop': {prev_count} → {len(candidates):,}")
-
-        for cycle in range(1, MAX_CYCLES + 1):
-            print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES}")
-
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
-                break
-
-            # --- Accelerate ---
-            print(f"[calibrate] Accelerating for {ACCEL_TIME}s...")
-            gamepad.hold_button(e.BTN_SOUTH)  # Cross = accelerate
-            gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
-            time.sleep(ACCEL_TIME)
-
-            # --- Snapshot while moving (throttle still held) ---
-            print("[calibrate] Snapshot (moving)...")
-            snap_moving = reader.snapshot_ee_ram()
-            time.sleep(1.0)
-            snap_moving_2 = reader.snapshot_ee_ram()
-
-            gamepad.release_button(e.BTN_SOUTH)
-            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-
-            # --- Filter: increased (stopped → moving) ---
-            results = NFSU2MemoryReader.diff_scan(
-                snap_stopped_2, snap_moving, "increased", candidates
-            )
-            candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'increased': → {len(candidates):,}")
-
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
-                break
-
-            # --- Filter: unchanged while moving (eliminates frame
-            # counters and animation state that keep changing) ---
-            results = NFSU2MemoryReader.diff_scan(
-                snap_moving, snap_moving_2, "unchanged", candidates
-            )
-            candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'unchanged@moving': → {len(candidates):,}")
-
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
-                break
-
-            # --- Stop the car ---
-            print("[calibrate] Stopping car...")
-            _stop_car()
-
-            print("[calibrate] Snapshot (stopped)...")
-            snap_stopped = reader.snapshot_ee_ram()
-            time.sleep(1.0)
-            snap_stopped_2 = reader.snapshot_ee_ram()
-
-            results = NFSU2MemoryReader.diff_scan(
-                snap_moving, snap_stopped, "decreased", candidates
-            )
-            candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'decreased': → {len(candidates):,}")
-
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
-                break
-
-            results = NFSU2MemoryReader.diff_scan(
-                snap_stopped, snap_stopped_2, "unchanged", candidates
-            )
-            candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'unchanged@stop': → {len(candidates):,}")
-
-        # --- Release all input ---
-        try:
-            gamepad.release_button(e.BTN_SOUTH)
-        except Exception:
-            pass
-        gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+        candidates = _phase1_stationary_scan(snap_stopped, STRUCT_MIN_SIZE)
+        print(f"[calibrate] Phase 1: {len(candidates):,} candidates after fingerprint filter")
 
         if not candidates:
-            print("\n[calibrate] ERROR: No candidates survived. Try re-running calibration.")
+            print("[calibrate] ERROR: No candidates found. Is the car stopped in-gear?")
             return
 
-        # --- Auto-verify candidates ---
-        print(f"\n[calibrate] Verifying {len(candidates):,} candidates...")
-        scored = _score_candidates(reader, candidates, gamepad)
+        # ── Phase 2: acceleration delta ──
+        print(f"\n[calibrate] Phase 2: accelerating for {ACCEL_TIME}s...")
+        gamepad.hold_button(e.BTN_SOUTH)
+        gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+        time.sleep(ACCEL_TIME)
 
-        # --- Display results ---
+        snap_moving = reader.snapshot_ee_ram()
+
+        gamepad.release_button(e.BTN_SOUTH)
+        gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+
+        candidates = _phase2_acceleration_verify(
+            snap_stopped, snap_moving, candidates
+        )
+        print(f"[calibrate] Phase 2: {len(candidates):,} candidates after acceleration filter")
+
+        if not candidates:
+            print("[calibrate] ERROR: No candidates survived acceleration filter.")
+            return
+
+        # ── Phase 3: structural integrity scoring ──
+        print(f"\n[calibrate] Phase 3: scoring {len(candidates):,} candidates on structural integrity...")
+        scored = _phase3_integrity_score(snap_stopped, snap_moving, candidates)
+
+        # Display results
         print(f"\n[calibrate] ── Results ({'top 20' if len(scored) > 20 else 'all'}) ──")
-        print(f"  {'Score':>5}  {'Speed Addr':>14}  {'Struct Base':>14}  "
-              f"{'Speed':>8}  {'RPM':>8}  {'Gear':>4}  {'Pos X':>10}  Speed Samples")
-        print(f"  {'─' * 5}  {'─' * 14}  {'─' * 14}  {'─' * 8}  {'─' * 8}  {'─' * 4}  {'─' * 10}  {'─' * 30}")
+        print(f"  {'Score':>5}  {'Struct Base':>14}  "
+              f"{'Speed(stop)':>11}  {'Speed(move)':>11}  {'RPM(idle)':>9}  {'Quat Σ²':>7}")
+        print(f"  {'─' * 5}  {'─' * 14}  {'─' * 11}  {'─' * 11}  {'─' * 9}  {'─' * 7}")
         for entry in scored[:20]:
-            samples_str = " → ".join(f"{v:.1f}" for v in entry.get("speed_samples", []))
             print(
                 f"  {entry['score']:5d}  "
-                f"0x{entry['speed_addr']:08X}  "
-                f"0x{entry['struct_base']:08X}  "
-                f"{entry['speed_ms']:8.2f}  "
-                f"{entry['rpm']:8.0f}  "
-                f"{entry['gear']:4d}  "
-                f"{entry['pos_x']:10.2f}  "
-                f"{samples_str}"
+                f"0x{entry['base']:08X}  "
+                f"{entry['speed_stopped']:11.4f}  "
+                f"{entry['speed_moving']:11.4f}  "
+                f"{entry['rpm_idle']:9.0f}  "
+                f"{entry['quat_sq']:7.4f}"
             )
 
         best = scored[0]
-        if best["score"] >= 5:
-            speed_addr = best["speed_addr"]
-            print(f"\n[calibrate] ✓ Best speed address: PS2 0x{speed_addr:08X} "
-                  f"(score {best['score']}/8)")
+        if best["score"] < 3:
+            print(f"\n[calibrate] ⚠ No high-confidence match (best score: {best['score']}).")
+            print("[calibrate] Try re-running calibration with a clean savestate.")
+            return
 
-            # --- Struct discovery: probe ±0x200 around speed addr ---
-            print("[calibrate] Probing neighborhood to find struct layout...")
-            layout = _probe_struct_layout(reader, gamepad, speed_addr)
+        vehicle_base = best["base"]
+        print(f"\n[calibrate] ✓ Best struct base: PS2 0x{vehicle_base:08X} "
+              f"(score {best['score']})")
 
-            # Save to calibration file
-            CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            cal_data = {}
-            for k, v in layout.items():
-                if isinstance(v, int):
-                    cal_data[k] = f"0x{v:08X}"
-                else:
-                    cal_data[k] = v
-            with open(CALIBRATION_FILE, "w") as f:
-                json.dump(cal_data, f, indent=2)
-            print(f"[calibrate] Saved to {CALIBRATION_FILE}")
-            print(f"[calibrate] Use with:  python main.py --telemetry")
+        # ── Phase 4: static pointer discovery ──
+        print("\n[calibrate] Phase 4: searching for static pointer...")
+        static_ptrs = _phase4_find_static_pointers(snap_moving, vehicle_base)
+
+        static_ptr_addr = 0
+        if static_ptrs:
+            static_ptr_addr = static_ptrs[0]
+            print(f"[calibrate] ✓ Found {len(static_ptrs)} static pointer(s):")
+            for ptr in static_ptrs[:5]:
+                print(f"    0x{ptr:08X}")
+            print(f"[calibrate]   Using 0x{static_ptr_addr:08X}")
         else:
-            print(f"\n[calibrate] ⚠ No high-confidence match (best score: {best['score']}/8).")
-            print("[calibrate] Try running calibration again, or use --snap/--scan-diff manually.")
+            print("[calibrate] ⚠ No static pointer found in 0x003X–0x005X range.")
+            print("[calibrate]   Saving direct address (may break on savestate reload).")
+
+        # ── Save calibration ──
+        cal_data = {
+            "vehicle_struct_addr": f"0x{vehicle_base:08X}",
+        }
+        if static_ptr_addr:
+            cal_data["static_pointer_addr"] = f"0x{static_ptr_addr:08X}"
+        cal_data["calibration_score"] = best["score"]
+
+        CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CALIBRATION_FILE, "w") as f:
+            json.dump(cal_data, f, indent=2)
+        print(f"\n[calibrate] Saved to {CALIBRATION_FILE}")
+        print(f"[calibrate] Use with:  python main.py --telemetry")
 
     finally:
         reader.close()
@@ -395,271 +330,206 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             print("[rocm-racer] PCSX2 terminated.")
 
 
-def _probe_struct_layout(
-    reader: "NFSU2MemoryReader",
-    gamepad: "VirtualGamepad",
-    speed_addr: int,
-) -> dict:
-    """Probe memory around the speed address to find actual struct offsets.
+# ---------------------------------------------------------------------------
+# Calibration phase helpers
+# ---------------------------------------------------------------------------
 
-    Reads ±0x200 bytes around speed_addr while stopped and while driving,
-    then identifies position (floats that change smoothly while driving),
-    RPM (float in engine range), and gear (small int).
+def _phase1_stationary_scan(data: bytes, struct_min_size: int) -> list[int]:
+    """Phase 1: find 16-byte-aligned bases matching a stationary vehicle.
 
-    Returns a dict of discovered addresses.
+    Checks: speed≈0, velocity≈(0,0,0), gear=1, quaternion normalized,
+    position finite and in valid world range.
+
+    Returns candidate base addresses (PS2 byte offsets).
     """
-    import math, struct as st
-    from evdev import ecodes as e
+    from memory_readers.nfsu2_memory import _EE_RAM_SIZE
 
-    PROBE_RANGE = 0x200  # bytes before and after speed_addr
-    start = max(0, (speed_addr - PROBE_RANGE) & ~3)  # align to 4-byte boundary
-    end = speed_addr + PROBE_RANGE
-    region_size = end - start
+    f32 = np.frombuffer(data, dtype=np.float32)
+    i32 = np.frombuffer(data, dtype=np.int32)
 
-    def _read_region(fmt: str = "<f") -> dict[int, float | int]:
-        """Read the probe region, interpreting each 4-byte slot with *fmt*."""
-        default = float("nan") if fmt == "<f" else 0
-        try:
-            raw = reader._pine.read_bulk(start, region_size)
-            vals = {}
-            for i in range(0, region_size, 4):
-                vals[start + i] = st.unpack_from(fmt, raw, i)[0]
-            return vals
-        except (RuntimeError, OSError):
-            vals = {}
-            read_fn = reader._read_f32 if fmt == "<f" else reader._read_i32
-            for i in range(0, region_size, 4):
-                addr = start + i
-                try:
-                    vals[addr] = read_fn(addr)
-                except (RuntimeError, OSError):
-                    vals[addr] = default
-            return vals
+    max_base = _EE_RAM_SIZE - struct_min_size
+    # 16-byte aligned candidates (every 4 float32 slots)
+    bases = np.arange(0, max_base, 16, dtype=np.int64)
 
-    # Read while stopped
-    stopped_vals = _read_region("<f")
-    stopped_ints = _read_region("<i")
+    def f_at(offset: int) -> np.ndarray:
+        return f32[(bases + offset) // 4]
 
-    # Accelerate for 3s then read again
-    gamepad.hold_button(e.BTN_SOUTH)
-    gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
-    time.sleep(3.0)
+    def i_at(offset: int) -> np.ndarray:
+        return i32[(bases + offset) // 4]
 
-    moving_vals = _read_region("<f")
-    moving_ints = _read_region("<i")
+    mask = np.ones(len(bases), dtype=bool)
 
-    # Wait a moment and read a third time to detect position (still changing)
-    time.sleep(1.0)
-    moving2_vals = _read_region("<f")
+    # Speed ≈ 0 when stopped
+    speed = f_at(0x090)
+    mask &= np.isfinite(speed) & (np.abs(speed) < 0.5)
 
-    gamepad.release_button(e.BTN_SOUTH)
-    gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+    # Velocity ≈ (0, 0, 0)
+    for off in (0x070, 0x074, 0x078):
+        v = f_at(off)
+        mask &= np.isfinite(v) & (np.abs(v) < 0.1)
 
-    # --- Find position candidates: floats that changed between stopped→moving
-    # AND keep changing between moving→moving2 (they track position) ---
-    pos_candidates: list[tuple[int, float, float, float]] = []
-    for addr in stopped_vals:
-        sv, mv, m2v = stopped_vals[addr], moving_vals.get(addr, float("nan")), moving2_vals.get(addr, float("nan"))
-        if not all(math.isfinite(v) for v in (sv, mv, m2v)):
-            continue
-        # Position should change between all three readings
-        if abs(mv - sv) > 1.0 and abs(m2v - mv) > 0.1:
-            # And should be world-coordinate magnitude (not tiny or huge)
-            if all(abs(v) < 100000 for v in (sv, mv, m2v)):
-                pos_candidates.append((addr, sv, mv, m2v))
+    # Gear = 1 (in-drive, stationary)
+    mask &= i_at(0x164) == 1
 
-    # --- Find RPM: float in engine range while moving ---
-    rpm_addr = None
-    for addr, mv in moving_vals.items():
-        if addr == speed_addr:
-            continue
-        if math.isfinite(mv) and 500.0 <= mv <= 15000.0:
-            sv = stopped_vals.get(addr, float("nan"))
-            # RPM should be low-ish when stopped (idle ~750) or zero
-            if math.isfinite(sv) and sv < 2000.0:
-                rpm_addr = addr
-                break  # take first match
+    # Quaternion at +0x030: 4 floats, sum of squares ≈ 1.0
+    r = [f_at(0x030 + i * 4) for i in range(4)]
+    quat_sq = sum(ri * ri for ri in r)
+    mask &= np.isfinite(quat_sq) & (quat_sq > 0.9) & (quat_sq < 1.1)
 
-    # --- Find gear: int 1–6 while moving, 0-1 while stopped ---
-    gear_addr = None
-    for addr in moving_ints:
-        mv = moving_ints[addr]
-        sv = stopped_ints.get(addr, -1)
-        if 1 <= mv <= 6 and 0 <= sv <= 1:
-            gear_addr = addr
-            break
+    # Position: finite and in valid world range
+    for off in (0x020, 0x024, 0x028):
+        p = f_at(off)
+        mask &= np.isfinite(p) & (np.abs(p) < 100_000)
 
-    # --- Display findings ---
-    print(f"\n[calibrate] ── Struct Discovery ──")
-    print(f"  Speed addr:    0x{speed_addr:08X}")
-
-    if pos_candidates:
-        print(f"\n  Position candidates (changed while driving):")
-        for addr, sv, mv, m2v in pos_candidates[:6]:
-            delta = speed_addr - addr
-            print(f"    0x{addr:08X} (speed{delta:+d}):  "
-                  f"stopped={sv:10.2f}  moving={mv:10.2f}  moving2={m2v:10.2f}")
-
-    if rpm_addr is not None:
-        rv_s = stopped_vals.get(rpm_addr, float("nan"))
-        rv_m = moving_vals.get(rpm_addr, float("nan"))
-        print(f"\n  RPM addr:      0x{rpm_addr:08X} (speed{speed_addr - rpm_addr:+d})  "
-              f"stopped={rv_s:.0f}  moving={rv_m:.0f}")
-    else:
-        print(f"\n  RPM addr:      not found")
-
-    if gear_addr is not None:
-        gv_s = stopped_ints.get(gear_addr, -1)
-        gv_m = moving_ints.get(gear_addr, -1)
-        print(f"  Gear addr:     0x{gear_addr:08X} (speed{speed_addr - gear_addr:+d})  "
-              f"stopped={gv_s}  moving={gv_m}")
-    else:
-        print(f"  Gear addr:     not found")
-
-    layout = {"speed_addr": speed_addr}
-    if pos_candidates:
-        layout["pos_candidates"] = [f"0x{a:08X}" for a, _, _, _ in pos_candidates[:3]]
-    if rpm_addr is not None:
-        layout["rpm_addr"] = rpm_addr
-    if gear_addr is not None:
-        layout["gear_addr"] = gear_addr
-
-    return layout
+    return bases[mask].tolist()
 
 
-def _score_candidates(
-    reader: "NFSU2MemoryReader",
+def _phase2_acceleration_verify(
+    data_stopped: bytes,
+    data_moving: bytes,
     candidates: list[int],
-    gamepad: "VirtualGamepad",
+) -> list[int]:
+    """Phase 2: keep candidates that show realistic acceleration behavior.
+
+    Checks: speed>0, velocity non-zero in XZ, RPM in engine range,
+    gear still 1, position horizontally changed.
+    """
+    f32_s = np.frombuffer(data_stopped, dtype=np.float32)
+    f32_m = np.frombuffer(data_moving, dtype=np.float32)
+    i32_m = np.frombuffer(data_moving, dtype=np.int32)
+
+    bases = np.array(candidates, dtype=np.int64)
+
+    def f_at(arr: np.ndarray, offset: int) -> np.ndarray:
+        return arr[(bases + offset) // 4]
+
+    def i_at(arr: np.ndarray, offset: int) -> np.ndarray:
+        return arr[(bases + offset) // 4]
+
+    mask = np.ones(len(bases), dtype=bool)
+
+    # Speed now positive and < 30 m/s (~108 km/h, first-gear range)
+    speed = f_at(f32_m, 0x090)
+    mask &= np.isfinite(speed) & (speed > 0.1) & (speed < 30.0)
+
+    # Velocity has non-zero horizontal component
+    vel_x = f_at(f32_m, 0x070)
+    vel_z = f_at(f32_m, 0x078)
+    mask &= (np.abs(vel_x) > 0.01) | (np.abs(vel_z) > 0.01)
+
+    # RPM in engine range
+    rpm = f_at(f32_m, 0x160)
+    mask &= np.isfinite(rpm) & (rpm >= 500) & (rpm <= 12000)
+
+    # Gear still = 1 (should not have shifted in 3s from standstill)
+    mask &= i_at(i32_m, 0x164) == 1
+
+    # Position moved horizontally since stopped
+    pos_x_s = f_at(f32_s, 0x020)
+    pos_z_s = f_at(f32_s, 0x028)
+    pos_x_m = f_at(f32_m, 0x020)
+    pos_z_m = f_at(f32_m, 0x028)
+    horiz_dist_sq = (pos_x_m - pos_x_s) ** 2 + (pos_z_m - pos_z_s) ** 2
+    mask &= np.isfinite(horiz_dist_sq) & (horiz_dist_sq > 1.0)
+
+    return bases[mask].tolist()
+
+
+def _phase3_integrity_score(
+    data_stopped: bytes,
+    data_moving: bytes,
+    candidates: list[int],
 ) -> list[dict]:
-    """Score candidate speed addresses with temporal live-driving verification.
+    """Phase 3: score candidates on structural integrity.
 
-    Takes multiple readings over time while accelerating and checks that
-    the candidate's speed actually changes (not a constant like gravity).
-
-    Returns a list of dicts sorted by score (descending).
+    Higher score = more likely to be the real player vehicle struct.
     """
     import math
-    from evdev import ecodes as e
 
-    addr_list = []
-    for speed_addr in candidates:
-        struct_base = speed_addr - 0x24
-        if struct_base >= 0:
-            addr_list.append((speed_addr, struct_base))
+    f32_s = np.frombuffer(data_stopped, dtype=np.float32)
+    f32_m = np.frombuffer(data_moving, dtype=np.float32)
 
-    # --- Read while stopped ---
-    print("[calibrate] Verification: reading while stopped...")
-    stopped: dict[int, dict] = {}
-    for speed_addr, base in addr_list:
-        try:
-            stopped[speed_addr] = {
-                "speed": reader._read_f32(speed_addr),
-                "pos_x": reader._read_f32(base + 0x00),
-                "pos_y": reader._read_f32(base + 0x04),
-                "pos_z": reader._read_f32(base + 0x08),
-            }
-        except (RuntimeError, OSError):
-            continue
-
-    # --- Accelerate at varying throttle and take 3 speed samples ---
-    throttle_steps = [0.1, 0.25, 0.5]
-    print(f"[calibrate] Verification: throttle steps {throttle_steps}...")
-    gamepad.hold_button(e.BTN_SOUTH)  # Cross = accelerate (required by NFS U2)
-
-    speed_samples: dict[int, list[float]] = {a: [] for a in stopped}
-    for throttle in throttle_steps:
-        gamepad.send(steering=0.0, throttle=throttle, brake=0.0)
-        time.sleep(1.5)
-        for speed_addr in stopped:
-            try:
-                speed_samples[speed_addr].append(reader._read_f32(speed_addr))
-            except (RuntimeError, OSError):
-                speed_samples[speed_addr].append(float("nan"))
-
-    # --- Final moving read (full struct) ---
-    moving: dict[int, dict] = {}
-    for speed_addr, base in addr_list:
-        if speed_addr not in stopped:
-            continue
-        try:
-            moving[speed_addr] = {
-                "speed": reader._read_f32(speed_addr),
-                "pos_x": reader._read_f32(base + 0x00),
-                "pos_y": reader._read_f32(base + 0x04),
-                "pos_z": reader._read_f32(base + 0x08),
-                "rpm": reader._read_f32(base + 0x1A4),
-                "gear": reader._read_i32(base + 0x1B0),
-            }
-        except (RuntimeError, OSError):
-            continue
-
-    gamepad.release_button(e.BTN_SOUTH)
-    gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-
-    # --- Score ---
-    results = []
-    for speed_addr, base in addr_list:
-        s = stopped.get(speed_addr)
-        m = moving.get(speed_addr)
-        if s is None or m is None:
-            continue
-
+    results: list[dict] = []
+    for base in candidates:
         score = 0
-        s_spd = s["speed"]
-        m_spd = m["speed"]
-        samples = speed_samples.get(speed_addr, [])
 
-        # 1. Speed near zero when stopped (< 1 m/s)
-        if math.isfinite(s_spd) and 0.0 <= s_spd < 1.0:
+        def _f(arr: np.ndarray, off: int) -> float:
+            return float(arr[(base + off) // 4])
+
+        # Quaternion precision (tighter tolerance)
+        r = [_f(f32_s, 0x030 + i * 4) for i in range(4)]
+        quat_sq = sum(v * v for v in r)
+        if 0.99 < quat_sq < 1.01:
+            score += 2
+        elif 0.95 < quat_sq < 1.05:
             score += 1
 
-        # 2. Speed positive and realistic when moving (1–100 m/s)
-        if math.isfinite(m_spd) and 1.0 <= m_spd <= 100.0:
+        # RPM idle when stopped (~800-1200, not 0 or garbage)
+        rpm_idle = _f(f32_s, 0x160)
+        if math.isfinite(rpm_idle) and 500 <= rpm_idle <= 1500:
+            score += 2
+
+        # Speed exactly 0 when stopped
+        speed_stopped = _f(f32_s, 0x090)
+        if abs(speed_stopped) < 0.01:
             score += 1
 
-        # 3. Speed CHANGED over time (not a constant like gravity)
-        #    Check that samples are mostly increasing and distinct
-        finite_samples = [v for v in samples if math.isfinite(v)]
-        if len(finite_samples) >= 2:
-            spread = max(finite_samples) - min(finite_samples)
-            if spread > 0.5:  # speed changed by at least 0.5 m/s
-                score += 2  # strong signal — eliminates constants
-                # Bonus: monotonically increasing (accelerating)
-                if all(b >= a - 0.1 for a, b in zip(finite_samples, finite_samples[1:])):
-                    score += 1
+        # Speed while moving is realistic
+        speed_moving = _f(f32_m, 0x090)
+        if 1.0 <= speed_moving <= 25.0:
+            score += 1
 
-        # 4. Position changed between stopped and moving
-        s_pos = (s["pos_x"], s["pos_y"], s["pos_z"])
-        m_pos = (m["pos_x"], m["pos_y"], m["pos_z"])
-        if all(math.isfinite(v) for v in s_pos + m_pos):
-            dist_sq = sum((a - b) ** 2 for a, b in zip(s_pos, m_pos))
-            if dist_sq > 1.0:
+        # RPM while moving in driving range
+        rpm_moving = _f(f32_m, 0x160)
+        if math.isfinite(rpm_moving) and 2000 <= rpm_moving <= 8000:
+            score += 1
+
+        # Vertical position roughly unchanged (not falling/flying)
+        pos_y_s = _f(f32_s, 0x024)
+        pos_y_m = _f(f32_m, 0x024)
+        if math.isfinite(pos_y_s) and math.isfinite(pos_y_m):
+            if abs(pos_y_m - pos_y_s) < 2.0:
                 score += 1
 
-        # 5. RPM in engine range while moving (500–15000)
-        m_rpm = m["rpm"]
-        if math.isfinite(m_rpm) and 500.0 <= m_rpm <= 15000.0:
-            score += 1
-
-        # 6. Gear is a small positive integer while moving
-        m_gear = m["gear"]
-        if 1 <= m_gear <= 6:
-            score += 1
-
         results.append({
-            "speed_addr": speed_addr,
-            "struct_base": base,
+            "base": base,
             "score": score,
-            "speed_ms": m_spd,
-            "speed_samples": finite_samples,
-            "pos_x": m_pos[0],
-            "rpm": m_rpm,
-            "gear": m_gear,
+            "speed_stopped": speed_stopped,
+            "speed_moving": speed_moving,
+            "rpm_idle": rpm_idle,
+            "quat_sq": quat_sq,
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
+
+
+def _phase4_find_static_pointers(data: bytes, vehicle_base: int) -> list[int]:
+    """Phase 4: find static pointers to the vehicle struct.
+
+    Searches all 32 MB for uint32 values matching the vehicle base address
+    (with and without kseg mirror bits).  Returns addresses in the static
+    data range (0x003XXXXX–0x005XXXXX), sorted by address.
+    """
+    u32 = np.frombuffer(data, dtype=np.uint32)
+
+    # The game may store the address as physical (kuseg) or kseg0/kseg1
+    targets = np.array([
+        vehicle_base,
+        vehicle_base | 0x80000000,   # kseg0
+        vehicle_base | 0xA0000000,   # kseg1
+    ], dtype=np.uint32)
+
+    pointers: list[int] = []
+    for target in targets:
+        matches = np.where(u32 == target)[0]
+        for idx in matches:
+            byte_addr = int(idx) * 4
+            if 0x00300000 <= byte_addr <= 0x005FFFFF:
+                pointers.append(byte_addr)
+
+    pointers.sort()
+    return pointers
 
 
 # ---------------------------------------------------------------------------
@@ -685,14 +555,14 @@ def _run_scan(args: argparse.Namespace) -> None:
         return
 
     print(f"\n[rocm-racer] Found {len(matches)} matches:\n")
-    print(f"  {'PS2 Address':>14s}    {'If speed (+0x24)':>14s}    Value")
-    print(f"  {'─' * 14}    {'─' * 14}    {'─' * 10}")
+    print(f"  {'PS2 Address':>14s}    {'If speed (+0x090)':>16s}    Value")
+    print(f"  {'─' * 14}    {'─' * 16}    {'─' * 10}")
 
     # Re-read to show actual values
     reader.open()
     for ps2_addr in matches[:50]:  # cap output at 50
         raw = reader._read_f32(ps2_addr)
-        struct_base = ps2_addr - 0x24
+        struct_base = ps2_addr - 0x090
         print(f"  0x{ps2_addr:08X}    0x{struct_base:08X}    {raw:.4f}")
     reader.close()
 
@@ -701,7 +571,7 @@ def _run_scan(args: argparse.Namespace) -> None:
 
     print(
         f"\n[rocm-racer] If you searched for absolute speed (m/s), the vehicle struct"
-        f"\n  base is at PS2 address = match - 0x24."
+        f"\n  base is at PS2 address = match - 0x090."
         f"\n  Verify with:  python main.py --vehicle-addr 0x<ADDR> --telemetry --no-launch"
     )
 
@@ -818,20 +688,21 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
 
     pcsx2_proc: subprocess.Popen | None = None
 
-    # Load calibration — support both old (vehicle_struct_addr) and
-    # new (individual speed_addr / pos / rpm / gear) formats.
+    # Load calibration
     cal: dict = {}
     vehicle_addr = args.vehicle_addr
-    if vehicle_addr is None and CALIBRATION_FILE.exists():
+    static_ptr = 0
+
+    if CALIBRATION_FILE.exists():
         with open(CALIBRATION_FILE, "r") as f:
             cal = json.load(f)
-        if "vehicle_struct_addr" in cal:
+        if "static_pointer_addr" in cal:
+            static_ptr = int(cal["static_pointer_addr"], 0)
+        if "vehicle_struct_addr" in cal and vehicle_addr is None:
             vehicle_addr = int(cal["vehicle_struct_addr"], 0)
-        elif "speed_addr" in cal:
-            # New format — individual addresses
-            vehicle_addr = 1  # non-zero sentinel; we read individual addrs
         print(f"[rocm-racer] Auto-loaded calibration from {CALIBRATION_FILE}")
-    if vehicle_addr is None:
+
+    if vehicle_addr is None and static_ptr == 0:
         print(
             "[rocm-racer] ERROR: --telemetry requires --vehicle-addr 0xADDR\n"
             "  or a saved calibration file (run --calibrate first).",
@@ -839,15 +710,11 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         )
         sys.exit(1)
 
-    offsets = TelemetryOffsets(vehicle_struct_addr=vehicle_addr)
+    offsets = TelemetryOffsets(
+        static_pointer_addr=static_ptr,
+        vehicle_struct_addr=vehicle_addr or 0,
+    )
     reader = NFSU2MemoryReader(offsets=offsets)
-
-    # Resolve individual addresses from calibration
-    speed_addr = int(cal["speed_addr"], 0) if "speed_addr" in cal else None
-    pos_addrs = [int(a, 0) for a in cal.get("pos_candidates", [])]
-    rpm_addr = int(cal["rpm_addr"], 0) if "rpm_addr" in cal else None
-    gear_addr = int(cal["gear_addr"], 0) if "gear_addr" in cal else None
-    use_individual = speed_addr is not None
 
     if not args.no_launch:
         write_controller_db()
@@ -858,11 +725,11 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         wait_for_pcsx2_ready()
 
     reader.open()
-    if use_individual:
-        addr_info = f"speed=0x{speed_addr:08X}"
-        if pos_addrs:
-            addr_info += f", pos[0]=0x{pos_addrs[0]:08X}"
-        print(f"[rocm-racer] Telemetry logging started ({addr_info}, backend=PINE)")
+    if static_ptr:
+        print(
+            f"[rocm-racer] Telemetry logging started "
+            f"(static ptr @ 0x{static_ptr:08X}, backend=PINE)"
+        )
     else:
         print(
             f"[rocm-racer] Telemetry logging started "
@@ -879,19 +746,8 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
     try:
         while True:
             try:
-                if use_individual:
-                    spd = reader._read_f32(speed_addr)
-                    pos = tuple(reader._read_f32(a) for a in pos_addrs) if pos_addrs else (0.0, 0.0, 0.0)
-                    rpm = reader._read_f32(rpm_addr) if rpm_addr else 0.0
-                    gear = reader._read_i32(gear_addr) if gear_addr else 0
-                    print(
-                        f"  Speed: {spd * 3.6:6.1f} km/h ({spd:.2f} m/s)  "
-                        f"Pos: ({', '.join(f'{v:9.2f}' for v in pos)})  "
-                        f"RPM: {rpm:7.0f}  Gear: {gear}"
-                    )
-                else:
-                    sample = reader.read_telemetry()
-                    print(f"  {sample.fmt()}")
+                sample = reader.read_telemetry()
+                print(f"  {sample.fmt()}")
             except RuntimeError as exc:
                 print(f"  [read error] {exc}")
             time.sleep(0.5)

@@ -16,7 +16,7 @@ The training loop utilizes a headless-capable, programmatic boot sequence to ens
 * **Emulator:** PCSX2 (Qt build) configured for **1x Native** internal resolution and **4:3** aspect ratio.
 * **Initialization:** `main.py` launches the emulator via CLI `subprocess.Popen`, injecting the `NeedForSpeed.iso` and a `-statefile` argument to boot directly into a pre-configured Save State (`.p2s`).
 * **Environment Sterility:** The Save State is anchored in free-drive mode on a continuous highway loop, derived from a **100% completion .max save** to bypass all tutorial scripts and locked regions.
-* **Memory Hooking:** The Python environment continuously polls `/proc/[pid]/maps` until the 32 MB Emotion Engine (EE) memory block is allocated, then establishes a direct read hook via `/proc/[pid]/mem`.
+* **Memory Access:** The Python environment connects to PCSX2's built-in PINE IPC server (a Unix socket at `$XDG_RUNTIME_DIR/pcsx2.sock`) to read the 32 MB Emotion Engine (EE) RAM directly using PS2-side addresses. No `/proc/pid/mem`, no ptrace, no kernel permission changes required. Enable PINE in `~/.config/PCSX2/inis/PCSX2.ini` with `EnablePINE = true`.
 
 **3. Multimodal Observation Space**
 The agent observes the environment through a dual-pipeline architecture, merging visual spatial awareness with absolute internal telemetry.

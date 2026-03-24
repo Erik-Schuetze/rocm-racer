@@ -33,8 +33,8 @@ This document compares the intended architecture (`architecture-overview.md`) ag
 | `-statefile` argument to boot into save state | ✅ | Implemented in `main.py::launch_pcsx2()` |
 | Highway loop `.p2s` save state (sterile anchor) | ✅ | `savestates/rocm-racer-nfsu2-highway.p2s` exists |
 | 100% completion `.max` save (bypass tutorials) | ✅ | `saves/need-for-speed-underground-2.5488.max` exists |
-| Poll `/proc/[pid]/maps` for 32 MB EE memory block | ✅ | Implemented in `main.py::wait_for_memory_map()` |
-| Establish `/proc/[pid]/mem` read hook | ✅ | Implemented in `memory_readers/nfsu2_memory.py` |
+| Poll `/proc/[pid]/maps` for 32 MB EE memory block | ❌ | Removed — PINE IPC is used instead |
+| Establish `/proc/[pid]/mem` read hook | ❌ | Removed — PINE IPC is used instead |
 | **Episode reset via savestate reload** | ❌ | `PCSX2RacerEnv.reset()` does not yet re-launch/reload PCSX2 savestate; the env exists but is not wired into `main.py` |
 
 ---
@@ -49,17 +49,17 @@ This document compares the intended architecture (`architecture-overview.md`) ag
 | Convert frames to grayscale | ❌ | Not implemented |
 | Downsample to **84×84** pixels | ❌ | Not implemented |
 | Stack **4 consecutive frames** into observation | ❌ | Not implemented |
-| Feed frame stack to a **CNN** | ❌ | No CNN model defined; `agents/ppo_agent.py` is a stub |
+| Feed frame stack to a **CNN** | ❌ | No CNN model defined |
 | Bumper camera perspective + HUD disabled (manual PCSX2 setting) | ✅ | Documented in `implementation-notes-for-human.md` as a manual step |
 
 ### 3b. Telemetry Pipeline (Proprioception) — MLP Branch
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Read `Float32` offsets from EE RAM via `/proc/[pid]/mem` | ✅ | Implemented in `nfsu2_memory.py` |
-| Absolute speed (m/s → km/h conversion) | ⚠️ | Field present in `TelemetryOffsets`; **offset value is a placeholder** — must be verified |
-| X / Y / Z global coordinates (meters) | ⚠️ | Fields present; **offset values are placeholders** |
-| Rotation (X / Y / Z) | ⚠️ | Fields present; **offset values are placeholders** |
+| Read `Float32` offsets from EE RAM via PINE IPC | ✅ | Implemented in `nfsu2_memory.py` |
+| Absolute speed (m/s → km/h conversion) | ⚠️ | Field present in `TelemetryOffsets`; offsets from new doc, needs live verification |
+| X / Y / Z global coordinates (meters) | ⚠️ | Fields present; offsets from new doc, needs live verification |
+| Rotation (X / Y / Z) | ⚠️ | Fields present; offsets from new doc, needs live verification |
 | Track progress flag | ⚠️ | Field present; **offset value is a placeholder** |
 | Feed 1D telemetry array to **MLP** | ⚠️ | Observation space defined as 8D vector in `pcsx2_env.py`; SB3 default MLP policy used — no explicit custom MLP defined |
 
@@ -68,7 +68,7 @@ This document compares the intended architecture (`architecture-overview.md`) ag
 | Requirement | Status | Notes |
 |---|---|---|
 | Concatenate CNN output + MLP output into single feature vector | ❌ | Not implemented; current observation is telemetry-only (no CNN branch) |
-| Custom `MultiInputPolicy` or combined feature extractor | ❌ | No custom policy class exists; `agents/ppo_agent.py` is a stub |
+| Custom `MultiInputPolicy` or combined feature extractor | ❌ | No custom policy class exists |
 
 ---
 
@@ -90,13 +90,13 @@ This document compares the intended architecture (`architecture-overview.md`) ag
 
 | Requirement | Status | Notes |
 |---|---|---|
-| PPO as primary algorithm | ✅ | `stable_baselines3.PPO` instantiated in `main.py::train_ppo()` |
-| PPO hyperparameters configured | ✅ | `n_steps=2048`, `batch_size=64`, `n_epochs=10`, `gamma=0.99`, `gae_lambda=0.95`, `clip_range=0.2`, `ent_coef=0.01`, `lr=3e-4` |
-| **PPO wired to `PCSX2RacerEnv`** | ❌ | `train_ppo()` and `PCSX2RacerEnv` both exist but are never connected; `main.py` currently runs keyboard test loop only |
+| PPO as primary algorithm | ⚠️ | `stable_baselines3.PPO` referenced; `train_ppo()` removed during cleanup, needs re-implementation |
+| PPO hyperparameters configured | ❌ | Removed during cleanup; needs re-implementation when training loop is wired |
+| **PPO wired to `PCSX2RacerEnv`** | ❌ | `PCSX2RacerEnv` exists but is not connected to any training loop |
 | `model.learn()` called in main training loop | ❌ | Not yet called in `main()` |
 | Model checkpointing / saving | ❌ | No `CheckpointCallback` or `model.save()` call exists |
-| TensorBoard logging | ⚠️ | Parameter plumbed through `train_ppo()`, but `model.learn()` is never called so logs are never written |
-| SAC as alternative algorithm | ❌ | `agents/sac_agent.py` is a 7-line stub |
+| TensorBoard logging | ❌ | Not yet implemented; needs training loop |
+| SAC as alternative algorithm | ❌ | Not implemented (stub removed during cleanup) |
 
 ---
 
@@ -105,11 +105,11 @@ This document compares the intended architecture (`architecture-overview.md`) ag
 | Item | Status | Notes |
 |---|---|---|
 | SDL3 game controller DB written before PCSX2 launch | ✅ | `main.py::write_controller_db()` |
-| Keyboard fallback controller (`xdotool`) | ✅ | `keyboard_controller.py` fully implemented |
-| NFSMW memory reader | ❌ | `nfsmw_memory.py` is a 10-line stub |
+| Keyboard fallback controller (`xdotool`) | ❌ | Removed during cleanup (unused fallback) |
+| NFSMW memory reader | ❌ | Removed during cleanup (empty stub) |
 | Unit / integration tests | ❌ | No test files in repo |
 | CI/CD pipeline | ❌ | No GitHub Actions / workflow files |
-| Custom PPO agent wrapper | ❌ | `agents/ppo_agent.py` is a 7-line stub |
+| Custom PPO agent wrapper | ❌ | Removed during cleanup (empty stub) |
 
 ---
 
@@ -120,9 +120,8 @@ The following items must be completed, roughly in dependency order:
 ### 🔴 Critical (Blocking Training)
 
 1. **Calibrate `TelemetryOffsets` in `nfsu2_memory.py`**  
-   All six offsets (speed, pos_x/y/z, rot_x/y/z, flags) are placeholder values.  
-   Use Cheat Engine (or `scanmem`) against a live PCSX2 session to locate the vehicle struct in EE RAM.  
-   Reference: `docs/underground-2-telemetry-memory-map.md`
+   Offsets updated from the new memory architecture doc. Run `--calibrate` to discover the vehicle struct base and static pointer via structural fingerprinting.  
+   Reference: `docs/ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md`
 
 2. **Wire `PCSX2RacerEnv` into `main.py`**  
    Replace the current keyboard test loop in `main()` with:
@@ -154,9 +153,9 @@ The following items must be completed, roughly in dependency order:
 
 ### 🟢 Future / Nice-to-Have
 
-7. **SAC agent** (`agents/sac_agent.py`) — alternative algorithm for improved sample efficiency.
+7. **SAC agent** — alternative algorithm for improved sample efficiency (not yet implemented).
 
-8. **NFSMW memory reader** (`memory_readers/nfsmw_memory.py`) — same RenderWare engine, independent offset calibration required.
+8. **NFSMW memory reader** — same RenderWare engine, independent offset calibration required (not yet implemented).
 
 9. **Unit tests** — at minimum, mock-based tests for `NFSU2MemoryReader` and `PCSX2RacerEnv` to validate reward shaping logic without a live emulator.
 

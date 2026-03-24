@@ -15,6 +15,6 @@
 
 ## Execution Strategy
 1. **Environment Initialization:** The Python training script (`main.py`) programmatically launches the PCSX2 process via CLI, passing the game ISO and the `-statefile` argument to boot directly into a pre-configured free-drive Save State.
-2. **Process Hooking:** The script polls `/proc/[pid]/maps` until the emulator's virtual memory block is allocated, then hooks into `/proc/[pid]/mem`.
-3. **Telemetry Extraction:** The agent reads hardcoded memory offsets (e.g., X/Y/Z coordinates, vehicle speed in **km/h**) to observe the environment.
+2. **Memory Access:** The script connects to PCSX2's built-in PINE IPC server (Unix socket) to read the 32 MB Emotion Engine (EE) RAM directly using PS2-side addresses. No kernel permission changes required.
+3. **Telemetry Extraction:** The agent reads known struct offsets (position, velocity, speed, rotation, RPM, gear) relative to a calibrated vehicle struct base pointer in EE RAM.
 4. **Episodic Reset:** Upon failure (e.g., wall collision, zero velocity), the Gymnasium wrapper sends a command to PCSX2 to instantly reload the anchor Save State (`.p2s`) on the highway loop to restart the training cycle.

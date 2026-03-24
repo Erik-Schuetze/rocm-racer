@@ -310,11 +310,11 @@ If `XDG_RUNTIME_DIR` is unset, it falls back to `/tmp/pcsx2.sock`.
 
 ### How the memory reader uses PINE
 
-`memory_readers/nfsu2_memory.py` tries PINE first, then falls back to `/proc/pid/mem`:
+`memory_readers/nfsu2_memory.py` uses PINE exclusively for all memory access:
 
-1. Attempt to connect to the PINE Unix socket
-2. If connected: all memory reads go through PINE (no PID detection, no EE base resolution needed — PINE uses PS2 addresses directly)
-3. If PINE is unavailable: fall back to resolving EE base from emulog + reading `/proc/pid/mem` (requires appropriate kernel settings)
+1. Connect to the PINE Unix socket (`$XDG_RUNTIME_DIR/pcsx2.sock`)
+2. All memory reads go through PINE using PS2-side addresses directly — no PID detection, no EE base resolution, no `/proc/pid/mem` fallback
+3. PINE must be enabled in PCSX2 (`EnablePINE = true` in `PCSX2.ini`)
 
 ### PINE protocol (for reference)
 

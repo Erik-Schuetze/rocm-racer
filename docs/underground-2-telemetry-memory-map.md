@@ -1,5 +1,11 @@
 # Need for Speed: Underground 2 - Telemetry Memory Map
 
+> **⚠️ DEPRECATED** — This document contains **estimated** offsets that have been
+> superseded by the verified research in
+> [`ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md`](ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md).
+> Use the new document as the authoritative reference. The corrected offsets are
+> now in the codebase (`TelemetryOffsets` in `memory_readers/nfsu2_memory.py`).
+
 ### Technical Deep-Dive
 
 **PCSX2 Emotion Engine Memory Architecture**

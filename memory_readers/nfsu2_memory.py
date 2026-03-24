@@ -20,28 +20,34 @@ _EE_RAM_SIZE = 0x0200_0000  # 32 MB PS2 EE physical RAM
 
 @dataclass(frozen=True)
 class TelemetryOffsets:
-    """Vehicle struct offsets from docs/underground-2-telemetry-memory-map.md.
+    """Vehicle struct offsets from docs/ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md.
 
-    ``vehicle_struct_addr`` is the PS2-side address where the vehicle struct
-    lives in EE RAM.  It must be discovered via ``--scan`` and set here (or
-    passed at construction time).  A value of 0 means *uncalibrated*.
+    ``static_pointer_addr`` is a PS2-side address in static data (typically
+    0x003X–0x005X) whose 4-byte value points to the dynamic vehicle struct
+    base.  When non-zero, ``resolve_vehicle_base()`` dereferences it on
+    every telemetry read so the address stays valid across savestate reloads.
+
+    ``vehicle_struct_addr`` is a direct fallback (for manual override or
+    debugging).  A value of 0 for both means *uncalibrated*.
     """
 
-    vehicle_struct_addr: int = 0x0000_0000  # UNCALIBRATED — see docs
+    static_pointer_addr: int = 0x0000_0000  # discovered by --calibrate
+    vehicle_struct_addr: int = 0x0000_0000  # manual override / debugging
 
-    # Struct member offsets (relative to vehicle_struct_addr)
-    position_x: int = 0x00        # Float32  lateral (meters)
-    position_y: int = 0x04        # Float32  vertical (meters)
-    position_z: int = 0x08        # Float32  longitudinal (meters)
-    velocity_x: int = 0x10        # Float32  lateral m/s
-    velocity_y: int = 0x14        # Float32  vertical m/s
-    velocity_z: int = 0x18        # Float32  longitudinal m/s
-    absolute_speed_ms: int = 0x24 # Float32  scalar speed m/s
-    rotation_x: int = 0x30        # Float32  pitch
-    rotation_y: int = 0x34        # Float32  yaw / heading
-    rotation_z: int = 0x38        # Float32  roll
-    engine_rpm: int = 0x1A4       # Float32
-    current_gear: int = 0x1B0     # Int32
+    # Struct member offsets (relative to vehicle struct base).
+    # All vector fields are 16-byte aligned (VPU0 hardware constraint).
+    position_x: int = 0x020        # Float32  lateral (meters)
+    position_y: int = 0x024        # Float32  vertical (meters)
+    position_z: int = 0x028        # Float32  longitudinal (meters)
+    rotation_x: int = 0x030        # Float32  QuatRot matrix — pitch
+    rotation_y: int = 0x034        # Float32  QuatRot matrix — yaw / heading
+    rotation_z: int = 0x038        # Float32  QuatRot matrix — roll
+    velocity_x: int = 0x070        # Float32  lateral m/s
+    velocity_y: int = 0x074        # Float32  vertical m/s
+    velocity_z: int = 0x078        # Float32  longitudinal m/s
+    absolute_speed_ms: int = 0x090 # Float32  scalar speed m/s
+    engine_rpm: int = 0x160        # Float32  (estimated)
+    current_gear: int = 0x164      # Int32    (estimated)
 
 
 @dataclass(frozen=True)
@@ -131,18 +137,31 @@ class NFSU2MemoryReader:
 
     # ----- telemetry -----
 
+    def resolve_vehicle_base(self) -> int:
+        """Dereference static pointer to get current dynamic vehicle struct base.
+
+        Falls back to ``vehicle_struct_addr`` if no pointer is configured.
+        Raises ``RuntimeError`` if uncalibrated.
+        """
+        self.open()
+        o = self.offsets
+        if o.static_pointer_addr != 0:
+            raw = self._pine.read_i32(o.static_pointer_addr) & 0xFFFFFFFF
+            # Strip kseg mirror bits to get physical EE address for PINE
+            return raw & 0x1FFFFFFF
+        elif o.vehicle_struct_addr != 0:
+            return o.vehicle_struct_addr
+        else:
+            raise RuntimeError(
+                "Vehicle struct address is uncalibrated.\n"
+                "Run:  python main.py --calibrate\n"
+                "See docs/ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md"
+            )
+
     def read_telemetry(self) -> TelemetrySample:
         self.open()
         o = self.offsets
-
-        if o.vehicle_struct_addr == 0:
-            raise RuntimeError(
-                "Vehicle struct address is uncalibrated (0x00000000).\n"
-                "Run:  python main.py --calibrate\n"
-                "See docs/underground-2-telemetry-memory-map.md for details."
-            )
-
-        base = o.vehicle_struct_addr
+        base = self.resolve_vehicle_base()
         speed_ms = self._read_f32(base + o.absolute_speed_ms)
         return TelemetrySample(
             position=(
