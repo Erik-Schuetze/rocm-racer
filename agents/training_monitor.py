@@ -15,8 +15,13 @@ Preview window (384×384, updated every N steps):
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
+
+# OpenCV ships its own Qt that only has the XCB (X11) plugin.
+# Force it before cv2 is imported to avoid a crash on Wayland sessions.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
 import numpy as np
