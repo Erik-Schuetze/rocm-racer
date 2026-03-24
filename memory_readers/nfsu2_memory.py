@@ -127,18 +127,11 @@ class NFSU2MemoryReader:
             else self.DEFAULT_CALIBRATION_FILE
         )
         self._pine: PINEClient | None = None
-        # Discovered offsets loaded from calibration.json
-        self._speed_offset: int = self.offsets.absolute_speed_ms
-        self._pos_offsets: tuple[int, int, int] = (
-            self.offsets.position_x, self.offsets.position_y, self.offsets.position_z
-        )
-        self._vel_offsets: tuple[int, int, int] = (
-            self.offsets.velocity_x, self.offsets.velocity_y, self.offsets.velocity_z
-        )
-        self._rot_offsets: tuple[int, int, int, int] = (
-            self.offsets.rotation_x, self.offsets.rotation_y,
-            self.offsets.rotation_z, self.offsets.rotation_w
-        )
+        # Absolute addresses loaded from calibration.json (0 = uncalibrated)
+        self._speed_addr: int = 0
+        self._pos_addrs: tuple[int, int, int] = (0, 0, 0)
+        self._vel_addrs: tuple[int, int, int] = (0, 0, 0)
+        self._rot_addrs: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._speed_unit: str = "unknown"
 
     # ----- lifecycle -----
@@ -153,7 +146,7 @@ class NFSU2MemoryReader:
         self._load_calibration()
 
     def _load_calibration(self) -> None:
-        """Load discovered offsets from calibration.json if present."""
+        """Load discovered absolute addresses from calibration.json if present."""
         import json
         if not self._cal_file.exists():
             return
@@ -165,34 +158,40 @@ class NFSU2MemoryReader:
                 val = cal.get(key, default)
                 return int(val, 0) if isinstance(val, str) else int(val)
 
-            # Override offsets with calibration values if present
-            if "speed_offset" in cal:
-                self._speed_offset = _hex("speed_offset")
-            if all(k in cal for k in ("pos_x_offset", "pos_y_offset", "pos_z_offset")):
-                self._pos_offsets = (
-                    _hex("pos_x_offset"), _hex("pos_y_offset"), _hex("pos_z_offset")
-                )
-            if all(k in cal for k in ("vel_x_offset", "vel_y_offset", "vel_z_offset")):
-                self._vel_offsets = (
-                    _hex("vel_x_offset"), _hex("vel_y_offset"), _hex("vel_z_offset")
-                )
-            if all(k in cal for k in ("rot_x_offset", "rot_y_offset", "rot_z_offset", "rot_w_offset")):
-                self._rot_offsets = (
-                    _hex("rot_x_offset"), _hex("rot_y_offset"),
-                    _hex("rot_z_offset"), _hex("rot_w_offset")
-                )
+            # Speed address (absolute PS2 address)
+            if "speed_addr" in cal:
+                self._speed_addr = _hex("speed_addr")
             if "speed_unit" in cal:
                 self._speed_unit = cal["speed_unit"]
 
-            # Also update static/direct address from calibration
+            # Position addresses (absolute)
+            if all(k in cal for k in ("pos_x_addr", "pos_y_addr", "pos_z_addr")):
+                self._pos_addrs = (
+                    _hex("pos_x_addr"), _hex("pos_y_addr"), _hex("pos_z_addr")
+                )
+
+            # Velocity addresses (absolute)
+            if all(k in cal for k in ("vel_x_addr", "vel_y_addr", "vel_z_addr")):
+                self._vel_addrs = (
+                    _hex("vel_x_addr"), _hex("vel_y_addr"), _hex("vel_z_addr")
+                )
+
+            # Rotation quaternion addresses (absolute)
+            if all(k in cal for k in ("rot_x_addr", "rot_y_addr", "rot_z_addr", "rot_w_addr")):
+                self._rot_addrs = (
+                    _hex("rot_x_addr"), _hex("rot_y_addr"),
+                    _hex("rot_z_addr"), _hex("rot_w_addr")
+                )
+
+            # Static pointer (for dynamic struct relocation)
             if "static_pointer_addr" in cal:
                 self.offsets = TelemetryOffsets(
                     static_pointer_addr=_hex("static_pointer_addr"),
-                    vehicle_struct_addr=_hex("vehicle_struct_addr", 0),
+                    vehicle_struct_addr=_hex("speed_addr", 0),
                 )
-            elif "vehicle_struct_addr" in cal:
+            elif "speed_addr" in cal:
                 self.offsets = TelemetryOffsets(
-                    vehicle_struct_addr=_hex("vehicle_struct_addr"),
+                    vehicle_struct_addr=_hex("speed_addr"),
                 )
 
             print(f"[rocm-racer] Calibration loaded from {self._cal_file}")
@@ -233,9 +232,8 @@ class NFSU2MemoryReader:
             )
 
     def is_calibrated(self) -> bool:
-        """Return True if offsets are loaded and struct address is known."""
-        o = self.offsets
-        return (o.static_pointer_addr != 0 or o.vehicle_struct_addr != 0) and self._speed_offset != 0
+        """Return True if speed address is known (minimum viable calibration)."""
+        return self._speed_addr != 0
 
     def read_telemetry(self) -> TelemetrySample:
         self.open()
@@ -244,9 +242,7 @@ class NFSU2MemoryReader:
                 "Vehicle struct address is uncalibrated.\n"
                 "Run:  python main.py --calibrate"
             )
-        base = self.resolve_vehicle_base()
-        speed_raw = self._read_f32(base + self._speed_offset)
-        # If unit is known km/h, convert to m/s; otherwise treat as m/s
+        speed_raw = self._read_f32(self._speed_addr)
         if self._speed_unit == "km/h":
             speed_ms = speed_raw / 3.6
             speed_kph = speed_raw
@@ -254,25 +250,43 @@ class NFSU2MemoryReader:
             speed_ms = speed_raw
             speed_kph = speed_raw * 3.6
 
+        # Read position (fallback to 0.0 if uncalibrated)
+        if any(a != 0 for a in self._pos_addrs):
+            position = (
+                self._read_f32(self._pos_addrs[0]),
+                self._read_f32(self._pos_addrs[1]),
+                self._read_f32(self._pos_addrs[2]),
+            )
+        else:
+            position = (0.0, 0.0, 0.0)
+
+        # Read velocity (fallback to 0.0 if uncalibrated)
+        if any(a != 0 for a in self._vel_addrs):
+            velocity = (
+                self._read_f32(self._vel_addrs[0]),
+                self._read_f32(self._vel_addrs[1]),
+                self._read_f32(self._vel_addrs[2]),
+            )
+        else:
+            velocity = (0.0, 0.0, 0.0)
+
+        # Read rotation quaternion (fallback to identity if uncalibrated)
+        if any(a != 0 for a in self._rot_addrs):
+            rotation = (
+                self._read_f32(self._rot_addrs[0]),
+                self._read_f32(self._rot_addrs[1]),
+                self._read_f32(self._rot_addrs[2]),
+                self._read_f32(self._rot_addrs[3]),
+            )
+        else:
+            rotation = (0.0, 0.0, 0.0, 1.0)
+
         return TelemetrySample(
-            position=(
-                self._read_f32(base + self._pos_offsets[0]),
-                self._read_f32(base + self._pos_offsets[1]),
-                self._read_f32(base + self._pos_offsets[2]),
-            ),
-            velocity=(
-                self._read_f32(base + self._vel_offsets[0]),
-                self._read_f32(base + self._vel_offsets[1]),
-                self._read_f32(base + self._vel_offsets[2]),
-            ),
+            position=position,
+            velocity=velocity,
             speed_ms=speed_ms,
             speed_kph=speed_kph,
-            rotation=(
-                self._read_f32(base + self._rot_offsets[0]),
-                self._read_f32(base + self._rot_offsets[1]),
-                self._read_f32(base + self._rot_offsets[2]),
-                self._read_f32(base + self._rot_offsets[3]),
-            ),
+            rotation=rotation,
         )
 
     # ----- scan helpers -----

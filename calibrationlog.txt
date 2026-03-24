@@ -1,0 +1,44 @@
+[rocm-racer] ══════════════════════════════════════════════════════
+[rocm-racer]  Calibration — differential scan + quaternion anchoring
+[rocm-racer] ══════════════════════════════════════════════════════
+[rocm-racer] Controller DB written to /home/eschuetze/.config/PCSX2/game_controller_db.txt
+[rocm-racer] Virtual gamepad created: /dev/input/event24
+[rocm-racer] Virtual gamepad ready (settled 2.0s).
+[rocm-racer] Launching: /usr/bin/pcsx2-qt -nogui -batch -statefile /home/eschuetze/workspace/rocm-racer/savestates/rocm-racer-nfsu2-highway-calibration.p2s -- /home/eschuetze/workspace/rocm-racer/iso/Need for Speed - Underground 2 (USA, Canada).iso
+[rocm-racer] PCSX2 output → /home/eschuetze/workspace/rocm-racer/pcsx2.log
+[rocm-racer] Waiting for PCSX2 to finish initialisation (timeout=30.0s)...
+[rocm-racer] PCSX2 ready — gamepad connected by SDL.
+[rocm-racer] Post-init delay: 2.0s for game to settle...
+[rocm-racer] Connected to PCSX2 via PINE IPC.
+[rocm-racer] Warning: could not load calibration: invalid literal for int() with base 0: '0x-1B0'
+
+[calibrate] Phase 1: snapshot while stopped (car must be stationary)...
+[rocm-racer] Reading 32 MB EE RAM via PINE (this may take a moment)...
+[calibrate] Phase 1: accelerating for 3.0s...
+[rocm-racer] Reading 32 MB EE RAM via PINE (this may take a moment)...
+[calibrate] Phase 1: 1,306 speed-float candidates
+[calibrate]   Top candidates (addr, value, unit):
+    0x000011F8    25.866 m/s
+    0x00081E58    25.845 m/s
+    0x00081F18    25.845 m/s
+    0x00081FA8    25.845 m/s
+    0x004B4EF0    49.768 km/h
+    0x004B4F60    49.768 km/h
+    0x004C69A0    21.092 m/s
+    0x004C69A4     6.727 km/h
+    0x004C69C0    21.088 m/s
+    0x004C69C4     6.727 km/h
+
+[calibrate] Phase 2: searching for quaternion anchor in ±0x200 of each candidate...
+[calibrate]   ✓ Speed @ 0x000011F8 (25.87 m/s) → quaternion @ 0x00001170 (Σ²=1.00000)
+
+[calibrate] Phase 3: discovering position/velocity offsets around quaternion...
+[calibrate]   ⚠  No velocity triplet found.
+[calibrate]   ⚠  No position triplet found.
+
+[calibrate] Phase 4: searching for static pointer to 0x000011F8...
+[calibrate]   ⚠  No static pointer found. Direct address saved.
+
+[calibrate] ✓ Saved to /home/eschuetze/workspace/rocm-racer/saves/calibration.json
+[calibrate]   Run `python main.py --telemetry` to verify.
+[rocm-racer] PCSX2 terminated.

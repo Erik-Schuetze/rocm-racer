@@ -210,12 +210,10 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     """Automated vehicle struct discovery via differential scanning + quaternion anchoring.
 
     Phase 1: Differential scan — find Float32 addresses that were ~0.0 when
-             stopped and are now in a speed-like range (15-35 m/s or 75-110 km/h).
-    Phase 2: Quaternion search — for each speed candidate, find a normalized
-             quaternion (4 adj floats, sum-of-squares ≈ 1.0) in ±0x200 window.
-    Phase 3: Offset discovery — empirically find position and velocity fields
-             by scanning around the quaternion anchor.
-    Phase 4: Static pointer scan — find a pointer to the struct in static
+             stopped and are now in a speed-like range (15–35 m/s or 75–110 km/h).
+    Phase 2: Score all candidates — for each speed candidate, search for quaternion,
+             velocity triplets, and position triplets nearby.  Pick the best.
+    Phase 3: Static pointer scan — find a pointer to the struct in static
              data range (0x003X–0x005X) for reload-safe calibration.
     """
     from memory_readers.nfsu2_memory import NFSU2MemoryReader, TelemetryOffsets
@@ -253,7 +251,8 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
         gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
         speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_moving)
-        print(f"[calibrate] Phase 1: {len(speed_candidates):,} speed-float candidates")
+        print(f"[calibrate] Phase 1: {len(speed_candidates):,} speed-float candidates "
+              f"(addresses ≥ 0x00100000)")
 
         if not speed_candidates:
             print("[calibrate] ERROR: No speed candidates found.")
@@ -261,58 +260,90 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             print("              then reaches >75 km/h during acceleration.")
             return
 
-        # Show top candidates
-        print(f"[calibrate]   Top candidates (addr, value, unit):")
-        for addr, val, unit in speed_candidates[:10]:
-            print(f"    0x{addr:08X}  {val:8.3f} {unit}")
-
-        # ── Phase 2: quaternion search around each speed candidate ──
-        print(f"\n[calibrate] Phase 2: searching for quaternion anchor in ±0x200 of each candidate...")
-        best_speed_addr = None
-        best_quat_addr  = None
-        best_speed_val  = None
-        best_speed_unit = None
+        # ── Phase 2: score ALL candidates (quaternion + velocity + position) ──
+        print(f"\n[calibrate] Phase 2: scoring all candidates "
+              f"(quaternion + velocity + position search)...")
+        scored: list[dict] = []
 
         for speed_addr, speed_val, speed_unit in speed_candidates:
+            score = 0
+            result: dict = {
+                "speed_addr": speed_addr,
+                "speed_val": speed_val,
+                "speed_unit": speed_unit,
+                "quat_addr": None,
+                "quat_sq": None,
+                "vel_triplet": None,
+                "pos_triplet": None,
+            }
+
+            # Quaternion search (±0x400)
             quats = _phase2_quaternion_search(snap_moving, speed_addr)
             if quats:
-                best_quat_addr  = quats[0][0]
-                best_speed_addr = speed_addr
-                best_speed_val  = speed_val
-                best_speed_unit = speed_unit
-                print(f"[calibrate]   ✓ Speed @ 0x{speed_addr:08X} ({speed_val:.2f} {speed_unit}) "
-                      f"→ quaternion @ 0x{best_quat_addr:08X} (Σ²={quats[0][1]:.5f})")
-                break
+                result["quat_addr"] = quats[0][0]
+                result["quat_sq"]   = quats[0][1]
+                score += 3
 
-        if best_quat_addr is None:
-            print("[calibrate] ⚠  No quaternion found near any speed candidate.")
-            print("[calibrate]   Saving speed-only calibration — pos/vel unavailable.")
-            best_speed_addr = speed_candidates[0][0]
-            best_speed_val  = speed_candidates[0][1]
-            best_speed_unit = speed_candidates[0][2]
-        else:
-            # ── Phase 3: discover position and velocity offsets ──
-            print(f"\n[calibrate] Phase 3: discovering position/velocity offsets around quaternion...")
+            # Velocity + position triplet search (±0x200 around quaternion or speed)
+            anchor = result["quat_addr"] if result["quat_addr"] is not None else speed_addr
             offsets_info = _phase3_discover_struct_offsets(
-                snap_stopped, snap_moving, best_speed_addr, best_quat_addr
+                snap_stopped, snap_moving, speed_addr, anchor, window=0x200
             )
-
             if offsets_info["vel_triplets"]:
-                vt = offsets_info["vel_triplets"][0]
-                print(f"[calibrate]   ✓ Velocity triplet: "
-                      f"0x{vt[0]:08X}, 0x{vt[1]:08X}, 0x{vt[2]:08X}")
-            else:
-                print("[calibrate]   ⚠  No velocity triplet found.")
-
+                result["vel_triplet"] = offsets_info["vel_triplets"][0]
+                score += 2
             if offsets_info["pos_triplets"]:
-                pt = offsets_info["pos_triplets"][0]
-                print(f"[calibrate]   ✓ Position triplet: "
-                      f"0x{pt[0]:08X}, 0x{pt[1]:08X}, 0x{pt[2]:08X}")
-            else:
-                print("[calibrate]   ⚠  No position triplet found.")
+                result["pos_triplet"] = offsets_info["pos_triplets"][0]
+                score += 2
 
-        # ── Phase 4: static pointer discovery ──
-        print(f"\n[calibrate] Phase 4: searching for static pointer to 0x{best_speed_addr:08X}...")
+            # Bonus: address in game heap region (0x003X+)
+            if speed_addr >= 0x00300000:
+                score += 1
+
+            result["score"] = score
+            scored.append(result)
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # Display top 15
+        print(f"\n[calibrate]   ── Top 15 candidates by structural score ──")
+        print(f"  {'Score':>5}  {'Speed Addr':>12}  {'Value':>8}  {'Unit':>4}  "
+              f"{'Quat':>12}  {'Vel':>5}  {'Pos':>5}")
+        print(f"  {'─'*5}  {'─'*12}  {'─'*8}  {'─'*4}  {'─'*12}  {'─'*5}  {'─'*5}")
+        for r in scored[:15]:
+            quat_str = f"0x{r['quat_addr']:08X}" if r['quat_addr'] else "—"
+            vel_str  = "✓" if r['vel_triplet'] else "—"
+            pos_str  = "✓" if r['pos_triplet'] else "—"
+            print(f"  {r['score']:5d}  0x{r['speed_addr']:08X}  "
+                  f"{r['speed_val']:8.3f}  {r['speed_unit']:>4}  "
+                  f"{quat_str:>12}  {vel_str:>5}  {pos_str:>5}")
+
+        best = scored[0]
+        if best["score"] < 3:
+            print(f"\n[calibrate] ⚠  No high-confidence match (best score: {best['score']}).")
+            print("[calibrate]   Try a longer acceleration or a different savestate.")
+            return
+
+        best_speed_addr = best["speed_addr"]
+        best_speed_val  = best["speed_val"]
+        best_speed_unit = best["speed_unit"]
+        best_quat_addr  = best["quat_addr"]
+
+        print(f"\n[calibrate] ✓ Best candidate: speed @ 0x{best_speed_addr:08X} "
+              f"({best_speed_val:.2f} {best_speed_unit}, score {best['score']})")
+
+        if best_quat_addr is not None:
+            print(f"[calibrate]   Quaternion @ 0x{best_quat_addr:08X} "
+                  f"(Σ²={best['quat_sq']:.5f})")
+        if best["vel_triplet"]:
+            vt = best["vel_triplet"]
+            print(f"[calibrate]   Velocity @ 0x{vt[0]:08X}, 0x{vt[1]:08X}, 0x{vt[2]:08X}")
+        if best["pos_triplet"]:
+            pt = best["pos_triplet"]
+            print(f"[calibrate]   Position @ 0x{pt[0]:08X}, 0x{pt[1]:08X}, 0x{pt[2]:08X}")
+
+        # ── Phase 3: static pointer discovery ──
+        print(f"\n[calibrate] Phase 3: searching for static pointer to 0x{best_speed_addr:08X}...")
         static_ptrs = _phase4_find_static_pointers(snap_moving, best_speed_addr)
 
         static_ptr_addr = 0
@@ -324,10 +355,9 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
         else:
             print("[calibrate]   ⚠  No static pointer found. Direct address saved.")
 
-        # ── Save calibration.json ──
+        # ── Save calibration.json (absolute addresses) ──
         cal_data: dict = {
-            "vehicle_struct_addr": f"0x{best_speed_addr:08X}",
-            "speed_offset":        "0x0",
+            "speed_addr":         f"0x{best_speed_addr:08X}",
             "speed_unit":          best_speed_unit,
             "speed_value_sample":  best_speed_val,
         }
@@ -335,22 +365,24 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             cal_data["static_pointer_addr"] = f"0x{static_ptr_addr:08X}"
 
         if best_quat_addr is not None:
-            cal_data["quat_offset"] = f"0x{best_quat_addr - best_speed_addr:X}"
-            cal_data["quat_addr"]   = f"0x{best_quat_addr:08X}"
+            cal_data["quat_addr"] = f"0x{best_quat_addr:08X}"
+            # Store individual rotation component addresses
+            for i, label in enumerate(("rot_x_addr", "rot_y_addr", "rot_z_addr", "rot_w_addr")):
+                cal_data[label] = f"0x{best_quat_addr + i * 4:08X}"
 
-            vel_triplets = offsets_info.get("vel_triplets", [])
-            if vel_triplets:
-                vt = vel_triplets[0]
-                cal_data["vel_x_offset"] = f"0x{vt[0] - best_speed_addr:X}"
-                cal_data["vel_y_offset"] = f"0x{vt[1] - best_speed_addr:X}"
-                cal_data["vel_z_offset"] = f"0x{vt[2] - best_speed_addr:X}"
+        if best["vel_triplet"]:
+            vt = best["vel_triplet"]
+            cal_data["vel_x_addr"] = f"0x{vt[0]:08X}"
+            cal_data["vel_y_addr"] = f"0x{vt[1]:08X}"
+            cal_data["vel_z_addr"] = f"0x{vt[2]:08X}"
 
-            pos_triplets = offsets_info.get("pos_triplets", [])
-            if pos_triplets:
-                pt = pos_triplets[0]
-                cal_data["pos_x_offset"] = f"0x{pt[0] - best_speed_addr:X}"
-                cal_data["pos_y_offset"] = f"0x{pt[1] - best_speed_addr:X}"
-                cal_data["pos_z_offset"] = f"0x{pt[2] - best_speed_addr:X}"
+        if best["pos_triplet"]:
+            pt = best["pos_triplet"]
+            cal_data["pos_x_addr"] = f"0x{pt[0]:08X}"
+            cal_data["pos_y_addr"] = f"0x{pt[1]:08X}"
+            cal_data["pos_z_addr"] = f"0x{pt[2]:08X}"
+
+        cal_data["calibration_score"] = best["score"]
 
         CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CALIBRATION_FILE, "w") as f:
@@ -373,24 +405,29 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 def _phase1_find_speed_candidates(
     data_stopped: bytes,
     data_moving: bytes,
+    min_addr: int = 0x00100000,
 ) -> list[tuple[int, float, str]]:
     """Phase 1: find speed float via differential scan.
 
     Finds Float32 addresses that were ~0.0 when stopped and are now in
-    either m/s range (15-35) or km/h range (75-110) while moving.
-    No struct offset or alignment assumptions.
+    either m/s range (15–35) or km/h range (75–110) while moving.
+    Excludes addresses below min_addr (kernel/BIOS area).
 
     Returns list of (ps2_addr, value_moving, unit_hint) tuples.
     """
     f32_s = np.frombuffer(data_stopped, dtype=np.float32)
     f32_m = np.frombuffer(data_moving, dtype=np.float32)
 
-    near_zero   = np.isfinite(f32_s) & (np.abs(f32_s) < 0.5)
+    near_zero    = np.isfinite(f32_s) & (np.abs(f32_s) < 0.5)
     in_ms_range  = np.isfinite(f32_m) & (f32_m >= 15.0) & (f32_m <= 35.0)
     in_kph_range = np.isfinite(f32_m) & (f32_m >= 75.0) & (f32_m <= 110.0)
 
+    indices = np.where(near_zero & (in_ms_range | in_kph_range))[0]
+    # Filter out kernel/BIOS area
+    indices = indices[indices * 4 >= min_addr]
+
     results: list[tuple[int, float, str]] = []
-    for idx in np.where(near_zero & (in_ms_range | in_kph_range))[0]:
+    for idx in indices:
         addr = int(idx) * 4
         val  = float(f32_m[idx])
         unit = "m/s" if 15.0 <= val <= 35.0 else "km/h"
@@ -402,11 +439,12 @@ def _phase1_find_speed_candidates(
 def _phase2_quaternion_search(
     data: bytes,
     speed_addr: int,
-    window: int = 0x200,
+    window: int = 0x400,
 ) -> list[tuple[int, float]]:
     """Phase 2: find normalized quaternion in ±window bytes around speed_addr.
 
     A quaternion is 4 adjacent Float32s where sum of squares ≈ 1.0.
+    Uses float64 arithmetic to avoid overflow on large garbage values.
     Returns list of (quat_base_addr, quat_sq) sorted by closeness to 1.0.
     """
     from memory_readers.nfsu2_memory import _EE_RAM_SIZE
@@ -424,7 +462,9 @@ def _phase2_quaternion_search(
         vals = f32[idx:idx + 4]
         if not np.all(np.isfinite(vals)):
             continue
-        sq = float(np.sum(vals * vals))
+        # Use float64 to prevent overflow on large values
+        vals64 = vals.astype(np.float64)
+        sq = float(np.sum(vals64 * vals64))
         if 0.98 < sq < 1.02:
             results.append((byte_off, sq))
 
@@ -671,33 +711,8 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
 
     pcsx2_proc: subprocess.Popen | None = None
 
-    # Load calibration
-    cal: dict = {}
-    vehicle_addr = args.vehicle_addr
-    static_ptr = 0
-
-    if CALIBRATION_FILE.exists():
-        with open(CALIBRATION_FILE, "r") as f:
-            cal = json.load(f)
-        if "static_pointer_addr" in cal:
-            static_ptr = int(cal["static_pointer_addr"], 0)
-        if "vehicle_struct_addr" in cal and vehicle_addr is None:
-            vehicle_addr = int(cal["vehicle_struct_addr"], 0)
-        print(f"[rocm-racer] Auto-loaded calibration from {CALIBRATION_FILE}")
-
-    if vehicle_addr is None and static_ptr == 0:
-        print(
-            "[rocm-racer] ERROR: --telemetry requires --vehicle-addr 0xADDR\n"
-            "  or a saved calibration file (run --calibrate first).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    offsets = TelemetryOffsets(
-        static_pointer_addr=static_ptr,
-        vehicle_struct_addr=vehicle_addr or 0,
-    )
-    reader = NFSU2MemoryReader(offsets=offsets)
+    # The reader auto-loads calibration.json in open()
+    reader = NFSU2MemoryReader()
 
     if not args.no_launch:
         write_controller_db()
@@ -708,16 +723,16 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         wait_for_pcsx2_ready()
 
     reader.open()
-    if static_ptr:
+
+    if not reader.is_calibrated():
         print(
-            f"[rocm-racer] Telemetry logging started "
-            f"(static ptr @ 0x{static_ptr:08X}, backend=PINE)"
+            "[rocm-racer] ERROR: No calibration data found.\n"
+            "  Run:  python main.py --calibrate",
+            file=sys.stderr,
         )
-    else:
-        print(
-            f"[rocm-racer] Telemetry logging started "
-            f"(vehicle struct @ PS2 0x{vehicle_addr:08X}, backend=PINE)"
-        )
+        sys.exit(1)
+
+    print(f"[rocm-racer] Telemetry logging started (speed @ 0x{reader._speed_addr:08X})")
     print("[rocm-racer] Accelerating (Cross). Press Ctrl-C to stop.\n")
 
     # Hold accelerate so the car moves and telemetry shows live data
