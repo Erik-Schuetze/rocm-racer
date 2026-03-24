@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import os
-import re
 import struct
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -16,12 +12,6 @@ from memory_readers.pine_client import PINEClient
 # EE RAM constants
 # ---------------------------------------------------------------------------
 _EE_RAM_SIZE = 0x0200_0000  # 32 MB PS2 EE physical RAM
-_PS2_ADDR_MASK = 0x1FFF_FFFF  # kseg0/kseg1 mirror mask
-
-_EMULOG_PATH = Path.home() / ".config" / "PCSX2" / "logs" / "emulog.txt"
-_EE_MEM_RE = re.compile(
-    r"EE Main Memory\s+@ (0x[0-9A-Fa-f]+)\s*->"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -100,81 +90,37 @@ class TelemetrySample:
 
 
 class NFSU2MemoryReader:
-    """PCSX2 memory reader for NFSU2 vehicle telemetry.
+    """PCSX2 memory reader for NFSU2 vehicle telemetry via PINE IPC.
 
-    **Primary backend — PINE IPC** (Unix socket):
-      Reads EE memory directly through PCSX2's built-in IPC server.
-      No ptrace, no ``/proc/pid/mem``, no kernel permission changes.
-      Enable PINE in ``~/.config/PCSX2/inis/PCSX2.ini``:
-        ``EnablePINE = true``
-
-    **Fallback — /proc/pid/mem** (requires matching UID + ptrace access):
-      Used when PINE is unavailable.  Needs ``ptrace_scope=0`` and
-      ``suid_dumpable=1`` on systems where PCSX2 has filesystem caps.
+    Reads EE memory directly through PCSX2's built-in IPC server.
+    No ptrace, no ``/proc/pid/mem``, no kernel permission changes.
+    Enable PINE in ``~/.config/PCSX2/inis/PCSX2.ini``:
+      ``EnablePINE = true``
     """
 
     def __init__(
         self,
-        pid: int | None = None,
         offsets: TelemetryOffsets | None = None,
-        process_names: Iterable[str] = ("pcsx2-qt", "pcsx2", "PCSX2"),
         pine_socket: str | None = None,
     ) -> None:
-        self.pid = pid
         self.offsets = offsets or TelemetryOffsets()
-        self.process_names = tuple(process_names)
         self.pine_socket = pine_socket
-
-        # Backend state — exactly one of these will be active after open()
         self._pine: PINEClient | None = None
-        self.mem_fd: int | None = None
-        self.ee_base: int | None = None
-        self._backend: str | None = None  # "pine" or "procmem"
 
     # ----- lifecycle -----
 
     def open(self) -> None:
-        if self._backend is not None:
+        if self._pine is not None:
             return
-
-        # --- Try PINE first ---
-        try:
-            pine = PINEClient(socket_path=self.pine_socket)
-            pine.connect()
-            self._pine = pine
-            self._backend = "pine"
-            print("[rocm-racer] Connected to PCSX2 via PINE IPC (no ptrace needed).")
-            return
-        except (OSError, ConnectionRefusedError) as exc:
-            print(f"[rocm-racer] PINE IPC unavailable ({exc}), falling back to /proc/pid/mem...")
-
-        # --- Fallback: /proc/pid/mem ---
-        self.pid = self.pid or self._detect_pid()
-        self.ee_base = self._resolve_ee_base()
-        try:
-            self.mem_fd = os.open(f"/proc/{self.pid}/mem", os.O_RDONLY)
-            self._backend = "procmem"
-        except PermissionError:
-            self._raise_permission_error()
-
-    def _raise_permission_error(self) -> None:
-        raise PermissionError(
-            f"Cannot read /proc/{self.pid}/mem.\n"
-            "Recommended fix: enable PINE IPC in PCSX2:\n"
-            "  Set EnablePINE = true in ~/.config/PCSX2/inis/PCSX2.ini\n"
-            "  then restart PCSX2.\n"
-            "Alternative (proc/mem fallback):\n"
-            "  echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope"
-        ) from None
+        pine = PINEClient(socket_path=self.pine_socket)
+        pine.connect()
+        self._pine = pine
+        print("[rocm-racer] Connected to PCSX2 via PINE IPC.")
 
     def close(self) -> None:
         if self._pine is not None:
             self._pine.close()
             self._pine = None
-        if self.mem_fd is not None:
-            os.close(self.mem_fd)
-            self.mem_fd = None
-        self._backend = None
 
     def __enter__(self) -> "NFSU2MemoryReader":
         self.open()
@@ -246,20 +192,8 @@ class NFSU2MemoryReader:
     def snapshot_ee_ram(self) -> bytes:
         """Read the entire 32 MB EE RAM as raw bytes."""
         self.open()
-
-        if self._backend == "pine":
-            print("[rocm-racer] Reading 32 MB EE RAM via PINE (this may take a moment)...")
-            return self._pine.read_bulk(0, _EE_RAM_SIZE)
-
-        # /proc/pid/mem path
-        if self.ee_base is None:
-            raise RuntimeError("EE base is unresolved.")
-        data = os.pread(self.mem_fd, _EE_RAM_SIZE, self.ee_base)
-        if len(data) < _EE_RAM_SIZE:
-            raise RuntimeError(
-                f"Short read of EE RAM: expected {_EE_RAM_SIZE} bytes, got {len(data)}."
-            )
-        return data
+        print("[rocm-racer] Reading 32 MB EE RAM via PINE (this may take a moment)...")
+        return self._pine.read_bulk(0, _EE_RAM_SIZE)
 
     @staticmethod
     def diff_scan(
@@ -322,98 +256,11 @@ class NFSU2MemoryReader:
 
     # ----- internals -----
 
-    def _detect_pid(self) -> int:
-        for entry in os.scandir("/proc"):
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            proc_comm = self._safe_read_text(f"/proc/{pid}/comm").strip()
-            proc_cmdline = self._safe_read_text(f"/proc/{pid}/cmdline").replace("\x00", " ")
-            if any(name in proc_comm or name in proc_cmdline for name in self.process_names):
-                return pid
-        names = ", ".join(self.process_names)
-        raise RuntimeError(f"Unable to find a running PCSX2 process matching: {names}")
-
-    def _resolve_ee_base(self) -> int:
-        """Resolve the host-side base address of PCSX2's EE Main Memory.
-
-        Primary: parse the PCSX2 emulog for the ``EE Main Memory @ 0x...``
-        line.  Fallback: scan ``/proc/[pid]/maps`` for the fastmem region
-        (a 4 GB anonymous rw-p mapping).
-        """
-        # --- try emulog first ---
-        try:
-            text = _EMULOG_PATH.read_text(errors="replace")
-            m = _EE_MEM_RE.search(text)
-            if m:
-                addr = int(m.group(1), 16)
-                print(f"[rocm-racer] EE base from emulog: 0x{addr:016x}")
-                return addr
-        except OSError:
-            pass
-
-        # --- fallback: scan /proc/pid/maps for fastmem (4 GB anon rw-p) ---
-        if self.pid is None:
-            raise RuntimeError("Cannot resolve EE base without a PID.")
-        maps_path = f"/proc/{self.pid}/maps"
-        with open(maps_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 2 or "rw-p" not in parts[1]:
-                    continue
-                addr_range = parts[0]
-                start_s, end_s = addr_range.split("-", 1)
-                start = int(start_s, 16)
-                end = int(end_s, 16)
-                size = end - start
-                # Fastmem is exactly 4 GB (0x1_0000_0000 bytes)
-                if size == 0x1_0000_0000:
-                    print(f"[rocm-racer] EE base from fastmem mapping: 0x{start:016x}")
-                    return start
-
-        raise RuntimeError(
-            "Unable to resolve PCSX2 EE base address.\n"
-            "Ensure PCSX2 is running and the emulog exists at:\n"
-            f"  {_EMULOG_PATH}"
-        )
-
     def _read_f32(self, ps2_addr: int) -> float:
-        if self._backend == "pine":
-            return self._pine.read_f32(ps2_addr)
-        return struct.unpack("<f", self._read_bytes_procmem(ps2_addr, 4))[0]
+        return self._pine.read_f32(ps2_addr)
 
     def _read_i32(self, ps2_addr: int) -> int:
-        if self._backend == "pine":
-            return self._pine.read_i32(ps2_addr)
-        return struct.unpack("<i", self._read_bytes_procmem(ps2_addr, 4))[0]
-
-    def _read_u8(self, ps2_addr: int) -> int:
-        if self._backend == "pine":
-            return self._pine.read8(ps2_addr)
-        return struct.unpack("<B", self._read_bytes_procmem(ps2_addr, 1))[0]
-
-    def _read_bytes_procmem(self, ps2_addr: int, size: int) -> bytes:
-        """Read bytes via /proc/pid/mem (fallback backend)."""
-        if self.mem_fd is None or self.ee_base is None:
-            raise RuntimeError("Memory reader is not open (procmem backend).")
-
-        masked = ps2_addr & _PS2_ADDR_MASK
-        absolute = self.ee_base + masked
-        data = os.pread(self.mem_fd, size, absolute)
-        if len(data) != size:
-            raise RuntimeError(
-                f"Short read from /proc/{self.pid}/mem at 0x{absolute:x}: "
-                f"expected {size} bytes, got {len(data)}."
-            )
-        return data
-
-    @staticmethod
-    def _safe_read_text(path: str) -> str:
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-                return handle.read()
-        except OSError:
-            return ""
+        return self._pine.read_i32(ps2_addr)
 
 
 __all__ = ["NFSU2MemoryReader", "TelemetryOffsets", "TelemetrySample"]

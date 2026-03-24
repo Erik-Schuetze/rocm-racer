@@ -119,32 +119,6 @@ def wait_for_pcsx2_ready(
 
 
 # ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-def train_ppo(env, total_timesteps: int, tensorboard_log: str | None) -> None:
-    from stable_baselines3 import PPO
-
-    model = PPO(
-        policy="MlpPolicy",
-        env=env,
-        verbose=1,
-        device="cuda",
-        tensorboard_log=tensorboard_log,
-        n_steps=2_048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        learning_rate=3e-4,
-    )
-    model.learn(total_timesteps=total_timesteps)
-    return model
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -187,17 +161,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     iso = ISO_MAP[args.game]
-
-    pcsx2_proc: subprocess.Popen | None = None
-
-    def _shutdown(sig, frame):
-        print("\n[rocm-racer] Shutting down...")
-        if pcsx2_proc is not None:
-            pcsx2_proc.terminate()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
 
     # --- Calibrate mode: automated vehicle struct discovery ---
     if args.calibrate:
@@ -269,7 +232,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     wait_for_pcsx2_ready()
 
     offsets = TelemetryOffsets(vehicle_struct_addr=1)  # dummy
-    reader = NFSU2MemoryReader(offsets=offsets, pid=pcsx2_proc.pid)
+    reader = NFSU2MemoryReader(offsets=offsets)
     reader.open()
 
     candidates: list[int] | None = None
@@ -453,60 +416,41 @@ def _probe_struct_layout(
     end = speed_addr + PROBE_RANGE
     region_size = end - start
 
-    def _read_region() -> dict[int, float]:
-        """Read the probe region as Float32 values using bulk read."""
+    def _read_region(fmt: str = "<f") -> dict[int, float | int]:
+        """Read the probe region, interpreting each 4-byte slot with *fmt*."""
+        default = float("nan") if fmt == "<f" else 0
         try:
             raw = reader._pine.read_bulk(start, region_size)
             vals = {}
             for i in range(0, region_size, 4):
-                addr = start + i
-                vals[addr] = st.unpack_from("<f", raw, i)[0]
-            return vals
-        except (RuntimeError, OSError):
-            # Fallback to individual reads
-            vals = {}
-            for i in range(0, region_size, 4):
-                addr = start + i
-                try:
-                    vals[addr] = reader._read_f32(addr)
-                except (RuntimeError, OSError):
-                    vals[addr] = float("nan")
-            return vals
-
-    def _read_region_i32() -> dict[int, int]:
-        """Read the probe region as Int32 values using bulk read."""
-        try:
-            raw = reader._pine.read_bulk(start, region_size)
-            vals = {}
-            for i in range(0, region_size, 4):
-                addr = start + i
-                vals[addr] = st.unpack_from("<i", raw, i)[0]
+                vals[start + i] = st.unpack_from(fmt, raw, i)[0]
             return vals
         except (RuntimeError, OSError):
             vals = {}
+            read_fn = reader._read_f32 if fmt == "<f" else reader._read_i32
             for i in range(0, region_size, 4):
                 addr = start + i
                 try:
-                    vals[addr] = reader._read_i32(addr)
+                    vals[addr] = read_fn(addr)
                 except (RuntimeError, OSError):
-                    pass
+                    vals[addr] = default
             return vals
 
     # Read while stopped
-    stopped_vals = _read_region()
-    stopped_ints = _read_region_i32()
+    stopped_vals = _read_region("<f")
+    stopped_ints = _read_region("<i")
 
     # Accelerate for 3s then read again
     gamepad.hold_button(e.BTN_SOUTH)
     gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
     time.sleep(3.0)
 
-    moving_vals = _read_region()
-    moving_ints = _read_region_i32()
+    moving_vals = _read_region("<f")
+    moving_ints = _read_region("<i")
 
     # Wait a moment and read a third time to detect position (still changing)
     time.sleep(1.0)
-    moving2_vals = _read_region()
+    moving2_vals = _read_region("<f")
 
     gamepad.release_button(e.BTN_SOUTH)
     gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
@@ -914,18 +858,15 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         wait_for_pcsx2_ready()
 
     reader.open()
-    backend_info = f"backend={reader._backend}"
-    if reader.ee_base is not None:
-        backend_info += f", EE base=0x{reader.ee_base:016x}"
     if use_individual:
         addr_info = f"speed=0x{speed_addr:08X}"
         if pos_addrs:
             addr_info += f", pos[0]=0x{pos_addrs[0]:08X}"
-        print(f"[rocm-racer] Telemetry logging started ({addr_info}, {backend_info})")
+        print(f"[rocm-racer] Telemetry logging started ({addr_info}, backend=PINE)")
     else:
         print(
             f"[rocm-racer] Telemetry logging started "
-            f"(vehicle struct @ PS2 0x{vehicle_addr:08X}, {backend_info})"
+            f"(vehicle struct @ PS2 0x{vehicle_addr:08X}, backend=PINE)"
         )
     print("[rocm-racer] Accelerating (Cross). Press Ctrl-C to stop.\n")
 

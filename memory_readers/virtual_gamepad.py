@@ -182,17 +182,6 @@ class VirtualGamepad:
         ui.write(e.EV_ABS, e.ABS_RY, ry_raw)
         ui.syn()
 
-    def press_button(self, button: int, duration: float = 0.05) -> None:
-        """Press and release a single digital button (evdev BTN_* keycode)."""
-        if self._uinput is None:
-            raise RuntimeError("VirtualGamepad is not open. Call open() first.")
-        ui = self._uinput
-        ui.write(e.EV_KEY, button, 1)
-        ui.syn()
-        time.sleep(duration)
-        ui.write(e.EV_KEY, button, 0)
-        ui.syn()
-
     def hold_button(self, button: int) -> None:
         """Hold a button down until release_button() is called."""
         if self._uinput is None:
