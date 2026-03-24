@@ -35,6 +35,9 @@ class TrainingMonitorCallback(BaseCallback):
     """
     SB3 callback that logs episode summaries and renders a live preview window.
 
+    Supports vectorized environments (N parallel envs). Episode stats are
+    tracked per-env. Preview always shows env 0.
+
     Parameters
     ----------
     preview : bool
@@ -57,13 +60,14 @@ class TrainingMonitorCallback(BaseCallback):
         self._preview_scale = preview_scale
         self._preview_interval = preview_interval
 
-        # Episode tracking
-        self._ep_count = 0
-        self._ep_start: float = time.monotonic()
-        self._ep_reward: float = 0.0
-        self._ep_speeds: list[float] = []
-        self._ep_max_dist: float = 0.0
-        self._last_reason: str = ""
+        # Per-env episode tracking (initialised in _on_training_start)
+        self._num_envs = 1
+        self._ep_count: list[int] = []
+        self._ep_start: list[float] = []
+        self._ep_reward: list[float] = []
+        self._ep_speeds: list[list[float]] = []
+        self._ep_max_dist: list[float] = []
+        self._last_reason: list[str] = []
 
         # Gradient update tracking
         self._update_count = 0
@@ -74,9 +78,18 @@ class TrainingMonitorCallback(BaseCallback):
     # ── SB3 lifecycle ─────────────────────────────────────────────────────
 
     def _on_training_start(self) -> None:
-        self._ep_start = time.monotonic()
+        self._num_envs = self.training_env.num_envs
+        now = time.monotonic()
+        self._ep_count = [0] * self._num_envs
+        self._ep_start = [now] * self._num_envs
+        self._ep_reward = [0.0] * self._num_envs
+        self._ep_speeds = [[] for _ in range(self._num_envs)]
+        self._ep_max_dist = [0.0] * self._num_envs
+        self._last_reason = [""] * self._num_envs
+
         n_steps = getattr(self.model, "n_steps", "?")
-        print(f"[monitor] Rollout size: {n_steps} steps per gradient update")
+        print(f"[monitor] Rollout size: {n_steps} steps per gradient update"
+              f" ({self._num_envs} env{'s' if self._num_envs > 1 else ''})")
         if self._preview:
             cv2.namedWindow("rocm-racer", cv2.WINDOW_NORMAL)
             cv2.resizeWindow(
@@ -96,69 +109,70 @@ class TrainingMonitorCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # Pull step data from SB3 locals (set by on_policy_algorithm.py)
-        rewards: np.ndarray = self.locals.get("rewards", np.zeros(1))
-        dones: np.ndarray = self.locals.get("dones", np.zeros(1, dtype=bool))
-        infos: list[dict[str, Any]] = self.locals.get("infos", [{}])
-        actions: np.ndarray = self.locals.get("actions", np.zeros((1, 2)))
+        rewards: np.ndarray = self.locals.get("rewards", np.zeros(self._num_envs))
+        dones: np.ndarray = self.locals.get("dones", np.zeros(self._num_envs, dtype=bool))
+        infos: list[dict[str, Any]] = self.locals.get("infos", [{}] * self._num_envs)
+        actions: np.ndarray = self.locals.get("actions", np.zeros((self._num_envs, 2)))
 
-        self._ep_reward += float(rewards[0])
-        info = infos[0] if infos else {}
+        for env_i in range(self._num_envs):
+            self._ep_reward[env_i] += float(rewards[env_i])
+            info = infos[env_i] if env_i < len(infos) else {}
 
-        speed_kph: float = info.get("speed_kph", 0.0)
-        self._ep_speeds.append(speed_kph)
+            speed_kph: float = info.get("speed_kph", 0.0)
+            self._ep_speeds[env_i].append(speed_kph)
 
-        dist: float = info.get("distance_from_start", 0.0)
-        if dist > self._ep_max_dist:
-            self._ep_max_dist = dist
+            dist: float = info.get("distance_from_start", 0.0)
+            if dist > self._ep_max_dist[env_i]:
+                self._ep_max_dist[env_i] = dist
 
+            reason = info.get("terminated_reason", "")
+            if reason:
+                self._last_reason[env_i] = reason
+
+            if dones[env_i]:
+                self._ep_count[env_i] += 1
+                elapsed = time.monotonic() - self._ep_start[env_i]
+
+                ep_info = info.get("episode", {})
+                total_reward = ep_info.get("r", self._ep_reward[env_i])
+                ep_steps = ep_info.get("l", len(self._ep_speeds[env_i]))
+
+                avg_speed = (
+                    sum(self._ep_speeds[env_i]) / len(self._ep_speeds[env_i])
+                    if self._ep_speeds[env_i] else 0.0
+                )
+                max_speed = max(self._ep_speeds[env_i]) if self._ep_speeds[env_i] else 0.0
+
+                n_steps = getattr(self.model, "n_steps", 2048)
+                rollout_pos = self.num_timesteps % n_steps
+                rollout_remaining = n_steps - rollout_pos if rollout_pos > 0 else 0
+
+                total_eps = sum(self._ep_count)
+                env_tag = f"/e{env_i}" if self._num_envs > 1 else ""
+                print(
+                    f"[ep {total_eps:4d}{env_tag}]"
+                    f"  {elapsed:6.1f}s"
+                    f"  {int(ep_steps):4d} steps"
+                    f"  R={total_reward:+7.1f}"
+                    f"  avg={avg_speed:5.0f} km/h"
+                    f"  max={max_speed:5.0f} km/h"
+                    f"  dist={self._ep_max_dist[env_i]:6.0f}m"
+                    f"  reason={self._last_reason[env_i] or 'truncated'}"
+                    f"  [{rollout_remaining:4d} to update]"
+                )
+
+                # Reset for next episode
+                self._ep_start[env_i] = time.monotonic()
+                self._ep_reward[env_i] = 0.0
+                self._ep_speeds[env_i] = []
+                self._ep_max_dist[env_i] = 0.0
+                self._last_reason[env_i] = ""
+
+        # Track env 0 action for preview overlay
         if actions is not None and len(actions) > 0:
             self._last_action = np.asarray(actions[0], dtype=np.float32)
 
-        # Check for reason even on non-terminal steps (stays "" until termination)
-        reason = info.get("terminated_reason", "")
-        if reason:
-            self._last_reason = reason
-
-        # Episode done — the SB3 Monitor wrapper injects info["episode"] on done
-        if dones[0]:
-            self._ep_count += 1
-            elapsed = time.monotonic() - self._ep_start
-
-            ep_info = info.get("episode", {})
-            total_reward = ep_info.get("r", self._ep_reward)
-            ep_steps = ep_info.get("l", len(self._ep_speeds))
-
-            avg_speed = (
-                sum(self._ep_speeds) / len(self._ep_speeds)
-                if self._ep_speeds else 0.0
-            )
-            max_speed = max(self._ep_speeds) if self._ep_speeds else 0.0
-
-            # Rollout progress (steps collected toward next gradient update)
-            n_steps = getattr(self.model, "n_steps", 2048)
-            rollout_pos = self.num_timesteps % n_steps
-            rollout_remaining = n_steps - rollout_pos if rollout_pos > 0 else 0
-
-            print(
-                f"[ep {self._ep_count:4d}]"
-                f"  {elapsed:6.1f}s"
-                f"  {int(ep_steps):4d} steps"
-                f"  R={total_reward:+7.1f}"
-                f"  avg={avg_speed:5.0f} km/h"
-                f"  max={max_speed:5.0f} km/h"
-                f"  dist={self._ep_max_dist:6.0f}m"
-                f"  reason={self._last_reason or 'truncated'}"
-                f"  [{rollout_remaining:4d} to update]"
-            )
-
-            # Reset for next episode
-            self._ep_start = time.monotonic()
-            self._ep_reward = 0.0
-            self._ep_speeds = []
-            self._ep_max_dist = 0.0
-            self._last_reason = ""
-
-        # Render preview window
+        # Render preview window (env 0 only)
         if self._preview and (self.n_calls % self._preview_interval == 0):
             self._render_preview(infos)
 

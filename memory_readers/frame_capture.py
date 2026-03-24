@@ -29,6 +29,7 @@ class FrameCaptureConfig:
     grayscale: bool = True
     frame_stack_size: int = 4
     crop_top_fraction: float = 1 / 6
+    pcsx2_pid: int | None = None  # Filter hyprctl by PID (multi-instance)
 
 
 class FrameCapture:
@@ -100,6 +101,8 @@ class FrameCapture:
     def _find_pcsx2_window(self) -> tuple[int, int, int, int]:
         """
         Query hyprctl for the PCSX2 window position and size.
+        When ``pcsx2_pid`` is set in the config, only the window owned by
+        that PID is matched — required for multi-instance training.
         Returns (x, y, width, height).
         Raises RuntimeError if PCSX2 is not running.
         """
@@ -112,14 +115,19 @@ class FrameCapture:
             raise RuntimeError(f"hyprctl not available: {e}") from e
 
         clients = json.loads(raw)
+        target_pid = self.cfg.pcsx2_pid
         for client in clients:
-            if client.get("class") == "pcsx2-qt":
-                x, y = client["at"]
-                w, h = client["size"]
-                return x, y, w, h
+            if client.get("class") != "pcsx2-qt":
+                continue
+            if target_pid is not None and client.get("pid") != target_pid:
+                continue
+            x, y = client["at"]
+            w, h = client["size"]
+            return x, y, w, h
 
+        pid_msg = f" (PID={target_pid})" if target_pid else ""
         raise RuntimeError(
-            "PCSX2 window not found via hyprctl. "
+            f"PCSX2 window{pid_msg} not found via hyprctl. "
             "Is PCSX2 running and visible on screen?"
         )
 

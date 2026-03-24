@@ -22,7 +22,6 @@ MEMCARDS_DIR = REPO_ROOT / "memcards"
 SAVESTATES_DIR = REPO_ROOT / "savestates"
 PCSX2_BIN = Path("/usr/bin/pcsx2-qt")
 PCSX2_CONFIG_DIR = Path.home() / ".config" / "PCSX2"
-PCSX2_INI = PCSX2_CONFIG_DIR / "inis" / "PCSX2.ini"
 CONTROLLER_DB_PATH = PCSX2_CONFIG_DIR / "game_controller_db.txt"
 ISO_MAP = {
     "nfsu2": ISO_DIR / "Need for Speed - Underground 2 (USA, Canada).iso",
@@ -58,31 +57,33 @@ def write_controller_db() -> None:
 # PCSX2 process management
 # ---------------------------------------------------------------------------
 
-def set_pcsx2_speed_scalar(scalar: int) -> None:
-    """
-    Patch NominalScalar in PCSX2.ini so PCSX2 runs at N× speed.
-    scalar=1 → normal, scalar=2 → double (turbo), etc.
-    The value is written before launching PCSX2; PCSX2 reads it on startup.
-    """
-    import re
-    text = PCSX2_INI.read_text()
-    text = re.sub(
-        r"(NominalScalar\s*=\s*)\S+",
-        lambda m: f"{m.group(1)}{scalar}",
-        text,
-    )
-    PCSX2_INI.write_text(text)
 
+def launch_pcsx2(
+    iso: Path,
+    statefile: Path | None = None,
+    turbo: bool = False,
+    env_override: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    """Launch PCSX2 in headless batch mode.
 
-def launch_pcsx2(iso: Path, statefile: Path | None = None, speed_scalar: int = 1) -> subprocess.Popen:
-    if speed_scalar != 1:
-        set_pcsx2_speed_scalar(speed_scalar)
-        print(f"[rocm-racer] Emulation speed: {speed_scalar}× (NominalScalar={speed_scalar})")
+    Parameters
+    ----------
+    iso : Path
+        Path to the PS2 ISO file.
+    statefile : Path, optional
+        Savestate to load on startup.
+    turbo : bool
+        Pass ``-turbo`` to PCSX2 for fast-forward emulation.
+    env_override : dict, optional
+        Extra environment variables (used for multi-instance isolation).
+    """
     cmd = [
         str(PCSX2_BIN),
         "-nogui",
         "-batch",
     ]
+    if turbo:
+        cmd.append("-turbo")
     if statefile is not None:
         if not statefile.exists():
             print(
@@ -94,17 +95,22 @@ def launch_pcsx2(iso: Path, statefile: Path | None = None, speed_scalar: int = 1
         cmd += ["-statefile", str(statefile)]
     cmd += ["--", str(iso)]
 
+    proc_env = None
+    if env_override:
+        proc_env = {**__import__("os").environ, **env_override}
+
     log_path = REPO_ROOT / "pcsx2.log"
     log_fh = open(log_path, "w")
     print(f"[rocm-racer] Launching: {' '.join(cmd)}")
     print(f"[rocm-racer] PCSX2 output → {log_path}")
-    return subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+    return subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=proc_env)
 
 
 def wait_for_pcsx2_ready(
     timeout: float = 30.0,
     poll: float = 0.25,
     post_ready_delay: float = 2.0,
+    emulog: Path | None = None,
 ) -> None:
     """Block until PCSX2 has loaded the savestate and the game is running.
 
@@ -116,8 +122,15 @@ def wait_for_pcsx2_ready(
 
     Falls back to a fixed timeout if the emulog is missing or the marker
     never appears (e.g. when running without a virtual gamepad).
+
+    Parameters
+    ----------
+    emulog : Path, optional
+        Custom emulog location (for multi-instance isolation).
+        Defaults to ``~/.config/PCSX2/logs/emulog.txt``.
     """
-    emulog = Path.home() / ".config" / "PCSX2" / "logs" / "emulog.txt"
+    if emulog is None:
+        emulog = Path.home() / ".config" / "PCSX2" / "logs" / "emulog.txt"
     deadline = time.monotonic() + timeout
 
     print(f"[rocm-racer] Waiting for PCSX2 to finish initialisation (timeout={timeout}s)...")
@@ -193,6 +206,8 @@ def parse_args() -> argparse.Namespace:
                         help="Disable the live OpenCV preview window during training")
     parser.add_argument("--turbo", action="store_true",
                         help="Run PCSX2 at 2× speed to accelerate training")
+    parser.add_argument("--num-envs", type=int, default=1,
+                        help="Number of parallel PCSX2 environments (default: 1)")
     return parser.parse_args()
 
 
@@ -1052,19 +1067,15 @@ def _run_vision(args: argparse.Namespace, iso: Path) -> None:
 
 def _run_train(args: argparse.Namespace, iso: Path) -> None:
     """
-    PPO training loop.
+    PPO training loop — single or multi-environment.
 
-    Launches PCSX2, wires the multimodal PCSX2RacerEnv, then runs
-    stable-baselines3 PPO with the MultimodalExtractor feature extractor.
-
-    Episode reset: PINE save_state(0) is called once after launch; subsequent
-    episode resets call load_state(0) for fast in-place reloads.
+    When ``--num-envs 1`` (default for backward compat), launches a single
+    PCSX2 instance with DummyVecEnv.  When N > 1, uses InstanceManager for
+    isolated PCSX2 instances and ThreadedVecEnv for parallel stepping.
     """
-    import subprocess as _sp
-    from pathlib import Path as _Path
-
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+    from stable_baselines3.common.vec_env import DummyVecEnv
 
     from agents.feature_extractor import MultimodalExtractor
     from agents.training_monitor import TrainingMonitorCallback
@@ -1073,48 +1084,116 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     from memory_readers.nfsu2_memory import NFSU2MemoryReader
     from memory_readers.virtual_gamepad import VirtualGamepad
 
+    num_envs: int = getattr(args, "num_envs", 1)
+    instance_mgr = None
     pcsx2_proc: subprocess.Popen | None = None
-    speed_scalar = 2 if args.turbo else 1
+
+    gamepads: list[VirtualGamepad] = []
+    readers: list[NFSU2MemoryReader] = []
+    frame_captures: list[FrameCapture] = []
+    envs: list[PCSX2RacerEnv] = []
 
     write_controller_db()
-    gamepad = VirtualGamepad()
-    gamepad.open()
 
-    pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile, speed_scalar=speed_scalar)
-    wait_for_pcsx2_ready()
-
-    # Connect PINE and verify calibration
-    reader = NFSU2MemoryReader()
-    reader.open()
-    if not reader.is_calibrated():
-        print(
-            "[rocm-racer] ERROR: No calibration data found.\n"
-            "  Run:  python main.py --calibrate",
-            file=sys.stderr,
-        )
-        gamepad.close()
-        pcsx2_proc.terminate()
-        sys.exit(1)
-
-    # Save initial state to slot 0 (enables fast load_state(0) resets)
-    print("[train] Saving initial state to slot 0 for episode resets...")
-    reader.save_state(0)
-    time.sleep(0.5)
-
-    # Frame capture
-    fc = FrameCapture(FrameCaptureConfig())
-    fc.open()
-
-    # Build environment
     env_config = PCSX2EnvConfig(device=args.device)
-    env = PCSX2RacerEnv(
-        memory_reader=reader,
-        gamepad=gamepad,
-        config=env_config,
-        frame_capture=fc,
-    )
 
-    # PPO with multimodal feature extractor
+    if num_envs == 1:
+        # ── Single-env path (original, no isolation overhead) ──────────
+        gamepad = VirtualGamepad()
+        gamepad.open()
+        gamepads.append(gamepad)
+
+        pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile, turbo=args.turbo)
+        wait_for_pcsx2_ready()
+
+        reader = NFSU2MemoryReader()
+        reader.open()
+        if not reader.is_calibrated():
+            print(
+                "[rocm-racer] ERROR: No calibration data found.\n"
+                "  Run:  python main.py --calibrate",
+                file=sys.stderr,
+            )
+            gamepad.close()
+            pcsx2_proc.terminate()
+            sys.exit(1)
+
+        print("[train] Saving initial state to slot 0 for episode resets...")
+        reader.save_state(0)
+        time.sleep(0.5)
+        readers.append(reader)
+
+        fc = FrameCapture(FrameCaptureConfig())
+        fc.open()
+        frame_captures.append(fc)
+
+        env = PCSX2RacerEnv(
+            memory_reader=reader, gamepad=gamepad,
+            config=env_config, frame_capture=fc,
+        )
+        envs.append(env)
+        vec_env = DummyVecEnv([lambda: env])
+
+    else:
+        # ── Multi-env path (InstanceManager + ThreadedVecEnv) ──────────
+        from environments.instance_manager import InstanceManager
+        from environments.threaded_vec_env import ThreadedVecEnv
+
+        instance_mgr = InstanceManager(
+            num_envs=num_envs, iso=iso, statefile=args.statefile,
+        )
+
+        print(f"[train] Launching {num_envs} PCSX2 instances (staggered)...")
+
+        for i in range(num_envs):
+            # 1. Prepare config + create gamepad BEFORE launching PCSX2
+            #    so SDL discovers it on startup.
+            cfg = instance_mgr.prepare_instance(i)
+            instance_mgr.instances.append(cfg)
+
+            gamepad = VirtualGamepad(name=f"rocm-racer-env-{i}")
+            gamepad.open()
+            gamepads.append(gamepad)
+
+            # 2. Launch this instance's PCSX2
+            instance_mgr.launch_instance(cfg, turbo=args.turbo)
+            instance_mgr.wait_for_instance(cfg)
+
+            # 3. Connect PINE to this instance's socket
+            reader = NFSU2MemoryReader(pine_socket=cfg.pine_socket)
+            reader.open()
+            if not reader.is_calibrated():
+                print(
+                    f"[instance-{i}] ERROR: No calibration data. Run --calibrate first.",
+                    file=sys.stderr,
+                )
+                instance_mgr.cleanup()
+                sys.exit(1)
+
+            print(f"[instance-{i}] Saving initial state to slot 0...")
+            reader.save_state(0)
+            time.sleep(0.5)
+            readers.append(reader)
+
+            # 4. Frame capture with PID-based matching
+            fc_cfg = FrameCaptureConfig(pcsx2_pid=cfg.pcsx2_pid)
+            fc = FrameCapture(fc_cfg)
+            fc.open()
+            frame_captures.append(fc)
+
+            env = PCSX2RacerEnv(
+                memory_reader=reader, gamepad=gamepad,
+                config=env_config, frame_capture=fc,
+            )
+            envs.append(env)
+
+        # Tile windows and build threaded vec env
+        instance_mgr.tile_windows()
+        vec_env = ThreadedVecEnv(envs)
+        print(f"[train] {num_envs} environments ready.")
+
+    # ── PPO model ──────────────────────────────────────────────────────
+
     policy_kwargs = dict(
         features_extractor_class=MultimodalExtractor,
         features_extractor_kwargs=dict(features_dim=512),
@@ -1141,7 +1220,7 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
 
     model = PPO(
         "MultiInputPolicy",
-        env,
+        vec_env,
         policy_kwargs=policy_kwargs,
         learning_rate=3e-4,
         n_steps=2048,
@@ -1156,6 +1235,7 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     )
 
     print(f"[train] Starting PPO training for {args.timesteps:,} timesteps...")
+    print(f"[train] Environments: {num_envs}")
     print(f"[train] Checkpoints → {models_dir}/")
     print(f"[train] TensorBoard → {tb_log}")
     if not args.no_preview:
@@ -1175,12 +1255,11 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         final_path = str(models_dir / "ppo_nfsu2_final")
         model.save(final_path)
         print(f"[train] Final model saved → {final_path}.zip")
-        env.close()
+        vec_env.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
-        if speed_scalar != 1:
-            set_pcsx2_speed_scalar(1)
-            print("[train] Restored PCSX2 speed to 1×")
+        if instance_mgr is not None:
+            instance_mgr.cleanup()
 
 
 # ---------------------------------------------------------------------------
