@@ -16,10 +16,17 @@ from memory_readers.virtual_gamepad import VirtualGamepad
 
 @dataclass(frozen=True)
 class RewardConfig:
-    speed_weight: float = 0.02       # per-step: reward = speed_kph * speed_weight (uncapped)
+    speed_weight: float = 0.02       # per-step: reward = min(speed, speed_cap) * speed_weight
+    speed_cap_kph: float = 150.0     # cap speed reward — no incentive to exceed this
+    time_penalty: float = -0.01      # per-step penalty to create urgency
     stuck_penalty: float = -10.0     # one-time penalty on stuck termination
     slow_timeout_penalty: float = -5.0  # one-time penalty on slow_timeout termination
     success_bonus: float = 50.0      # applied when distance > success_distance_m
+    milestone_rewards: tuple = (     # (distance_m, bonus) pairs, ascending
+        (100.0, 2.0),
+        (250.0, 5.0),
+        (500.0, 10.0),
+    )
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._start_position: tuple[float, float, float] | None = None
         self._slow_speed_elapsed: float = 0.0
         self._stuck_elapsed: float = 0.0
+        self._milestones_hit: set[float] = set()  # distances already rewarded
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -129,6 +137,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps = 0
         self._slow_speed_elapsed = 0.0
         self._stuck_elapsed = 0.0
+        self._milestones_hit = set()
 
         self._last_telemetry = self.memory_reader.read_telemetry()
         self._start_position = self._last_telemetry.position
@@ -155,11 +164,21 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps += 1
 
         # --- Compute per-step reward ---
-        speed_term = self.config.reward.speed_weight * telemetry.speed_kph
-        reward_terms: dict[str, float] = {"speed": speed_term}
+        capped_speed = min(telemetry.speed_kph, self.config.reward.speed_cap_kph)
+        speed_term = self.config.reward.speed_weight * capped_speed
+        reward_terms: dict[str, float] = {
+            "speed": speed_term,
+            "time": self.config.reward.time_penalty,
+        }
 
         # --- Distance from start ---
         distance = self._euclidean_distance(telemetry.position)
+
+        # --- Milestone bonuses (one-time, ascending) ---
+        for milestone_dist, milestone_bonus in self.config.reward.milestone_rewards:
+            if distance >= milestone_dist and milestone_dist not in self._milestones_hit:
+                self._milestones_hit.add(milestone_dist)
+                reward_terms[f"milestone_{int(milestone_dist)}m"] = milestone_bonus
 
         # --- Termination conditions ---
         terminated = False
