@@ -168,11 +168,15 @@ In NFS Underground 2 (PS2, NTSC-U), the default on-foot/driving controls are:
 
 | Action      | PS2 button |
 |-------------|------------|
-| Accelerate  | **✕ (Cross)** |
-| Brake/Reverse | ○ (Circle) |
-| Handbrake   | □ (Square)  |
-| Nitrous     | △ (Triangle) |
+| Accelerate  | **✕ (Cross)** or Right stick ↑ |
+| Brake/Reverse | □ (Square) or Right stick ↓ |
+| Change camera | △ (Triangle) |
+| Look back   | ○ (Circle)  |
+| E-brake     | R1          |
+| Nitrous     | L1          |
 | Steer       | Left stick X |
+| Shift up    | R2 (manual only) |
+| Shift down  | L2 (manual only) |
 
 **Cross (✕) is accelerate**, not R2. This is the PS2 default for EA Black Box racing games of this era. `BTN_SOUTH` → SDL `FaceSouth` → PCSX2 `Cross` maps to this.
 
@@ -189,6 +193,64 @@ If the `game_controller_db.txt` GUID does not match (e.g. after a kernel or SDL 
 | Left stick X- | `SDL-0/-JoyAxis0` |
 
 To verify which mode SDL3 assigned, check the PCSX2 console log for either `"Gamepad N inserted"` (gamepad path) or `"Joystick N inserted"` (raw joystick path).
+
+## Input timing: why sending input too early silently fails
+
+The virtual gamepad must send its first input **after** PCSX2 has fully loaded the savestate and the game is running. Sending input earlier appears to work (no errors) but the game never sees it.
+
+### The problem
+
+When PCSX2 loads a savestate, it restores the PS2 PAD (controller) state from `PAD.bin` inside the `.p2s` archive. This overwrites whatever SDL has reported so far. If a button was already held when the savestate finishes loading, the game sees the restored "no buttons pressed" PAD state and, because the button is already down, **no new press event is generated** — the game never detects a transition.
+
+A physical controller doesn't have this problem because the user presses buttons *after* the game is visibly running.
+
+### PCSX2 startup timeline (typical, from emulog)
+
+| Time     | Event                                      |
+|----------|--------------------------------------------|
+| T+0.00s  | PCSX2 process starts                       |
+| T+0.004s | EE/IOP memory allocated (visible in maps)  |
+| T+0.57s  | SDL3 input initialised, mappings loaded    |
+| T+0.79s  | `PAD.bin` found in savestate (PAD restored)|
+| T+0.89s  | SPU2 + GS restore from savestate           |
+| T+0.95s  | SDL opens virtual gamepad as SDL-0         |
+| T+~1.0s  | Game starts rendering (first frame)        |
+
+The gamepad connection at T+0.95s happens *during or just after* the savestate restore. Any button state present at that instant is read by SDL's `PollAllValues()` (via `EVIOCGKEY`), but the resulting SDL event is either consumed before the PAD restore completes or overwritten by the restored PAD state.
+
+### The fix: `wait_for_pcsx2_ready()`
+
+`main.py` monitors `~/.config/PCSX2/logs/emulog.txt` for the line:
+
+```
+SDLInputSource: Opened gamepad 1 (instance id 1, player id 0): rocm-racer Virtual Gamepad
+```
+
+This confirms both that the savestate has been loaded and that SDL has connected the virtual gamepad. After detecting this marker, a configurable post-ready delay (default 2 seconds) lets the game run several frames and establish its baseline controller state before any input is sent.
+
+### Important: PCSX2 must have `EnableControllerLogs = true`
+
+The `Opened gamepad` marker is logged by `SDLInputSource`. If controller logging is disabled, the emulog won't contain this line and the readiness check falls back to a fixed timeout. Verify the setting in `~/.config/PCSX2/inis/PCSX2.ini`:
+
+```ini
+[Logging]
+EnableControllerLogs = true
+```
+
+(PCSX2 defaults this to `true`; only set it explicitly if you've changed it.)
+
+### Emulog location and staleness
+
+The emulog at `~/.config/PCSX2/logs/emulog.txt` is overwritten on each PCSX2 launch. `wait_for_pcsx2_ready()` polls it every 250ms. Because the file is rewritten from scratch, there is no risk of matching a stale marker from a previous run — the marker only appears once the *current* PCSX2 instance has connected the gamepad.
+
+### Checklist for debugging "car doesn't move"
+
+1. **Verify gamepad detection** — check emulog for `"Opened gamepad"` and `"Gamepad 0 has 6 axes and 12 buttons"`
+2. **Verify bindings** — `~/.config/PCSX2/inis/PCSX2.ini` `[Pad1]` section must use SDL3 names (`SDL-0/FaceSouth`, not `SDL-0/Button0`)
+3. **Verify timing** — the `[rocm-racer]` console output should show `"PCSX2 ready"` *before* `"Test mode: accelerating"`
+4. **Verify PauseOnFocusLoss** — must be `false` in `PCSX2.ini` under `[UI]`, otherwise the game pauses when PCSX2 doesn't have window focus
+5. **Verify game state** — the savestate must have the car on a driveable road (not in a menu, cutscene, or garage)
+6. **Try increasing post-ready delay** — pass a longer delay if the game takes more time to settle (e.g. on slower hardware): edit `wait_for_pcsx2_ready(post_ready_delay=5.0)` in `main.py`
 
 ## Keyboard fallback (xdotool)
 

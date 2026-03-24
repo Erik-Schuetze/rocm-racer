@@ -36,16 +36,27 @@ If you save to a different path, pass it explicitly:
 python main.py --statefile /path/to/your/save.p2s
 ```
 
-## 3. Add your user to the `input` group (required for uinput virtual gamepad)
+## 3. Set up `/dev/uinput` permissions (required for virtual gamepad)
 
-The virtual gamepad uses `/dev/uinput`. Your user needs write access:
+The virtual gamepad uses `/dev/uinput` which requires both the kernel module and correct device permissions. Run the one-time setup script:
 
 ```bash
-sudo usermod -aG input $USER
-# log out and back in for the group change to take effect
+sudo bash setup-uinput.sh
 ```
 
-Alternatively, run the training script with `sudo` (not recommended for long-term use).
+This does three things:
+1. Ensures the `uinput` kernel module loads on every boot (`/etc/modules-load.d/uinput.conf`).
+2. Creates a udev rule so `/dev/uinput` is owned by the `input` group with mode `0660` (`/etc/udev/rules.d/99-uinput.rules`).
+3. Adds your user to the `input` group.
+
+**You must log out and back in** (or reboot) after running the script for the group membership to take effect.
+
+To verify it worked:
+
+```bash
+ls -la /dev/uinput          # should show group 'input', mode crw-rw----
+id -nG | grep -w input      # should print 'input'
+```
 
 ## 4. Controller bindings — automated
 

@@ -26,3 +26,4 @@ runs/
 
 # PCSX2 controller db is written at runtime by main.py — no need to track
 # ~/.config/PCSX2/game_controller_db.txt
+pcsx2.log

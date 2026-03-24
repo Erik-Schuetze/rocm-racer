@@ -78,17 +78,34 @@ class VirtualGamepad:
     """
     Linux uinput virtual DualShock2-like gamepad for PCSX2 action injection.
 
-    Axis mapping:
-      steering  [-1.0,  1.0]  → ABS_X  (left stick horizontal)
-      throttle  [ 0.0,  1.0]  → ABS_RZ (R2 analog trigger)
-      brake     [ 0.0,  1.0]  → ABS_Z  (L2 analog trigger)
+    NFS Underground 2 PS2 control scheme (EA Black Box, NTSC-U)
+    =============================================================
+    Digital buttons (current test mode):
+      X       (BTN_SOUTH / b0)  → Accelerate
+      Square  (BTN_WEST  / b3)  → Brake / Reverse
+      Triangle(BTN_NORTH / b2)  → Change camera
+      Circle  (BTN_EAST  / b1)  → Look back
+      R1      (BTN_TR    / b5)  → E-brake
+      L1      (BTN_TL    / b4)  → Nitrous
+
+    Analog (future RL training — right stick Y axis, ABS_RY = a4):
+      Right stick UP   (ABS_RY 0..127,   SDL-0/-RightY)  → Accelerate [0.0–1.0]
+      Right stick DOWN (ABS_RY 129..255, SDL-0/+RightY)  → Brake      [0.0–1.0]
+
+      send() maps: net = throttle - brake → ABS_RY (0 = full up, 128 = center, 255 = full down)
+
+    NOTE: R2 (ABS_RZ / +RightTrigger) = Shift UP
+          L2 (ABS_Z  / +LeftTrigger)  = Shift DOWN
+          Do NOT use triggers for throttle or brake.
+
+    Steering is always left stick horizontal (ABS_X).
 
     Requires write access to /dev/uinput. Add your user to the `input` group
     or run with sufficient privileges:
         sudo usermod -aG input $USER
     """
 
-    def __init__(self, name: str = "rocm-racer Virtual Gamepad", settle_seconds: float = 0.5) -> None:
+    def __init__(self, name: str = "rocm-racer Virtual Gamepad", settle_seconds: float = 2.0) -> None:
         self.name = name
         self.settle_seconds = settle_seconds
         self._uinput: UInput | None = None
@@ -96,16 +113,28 @@ class VirtualGamepad:
     def open(self) -> None:
         if self._uinput is not None:
             return
-        self._uinput = UInput(
-            _CAPABILITIES,
-            name=self.name,
-            bustype=e.BUS_USB,   # 0x03 → matches SDL_GUID
-            vendor=0x0000,
-            product=0x0000,
-            version=0x0003,
-        )
-        # Give the OS and PCSX2's SDL backend time to enumerate the new device.
+        try:
+            self._uinput = UInput(
+                _CAPABILITIES,
+                name=self.name,
+                bustype=e.BUS_USB,   # 0x03 → matches SDL_GUID
+                vendor=0x0000,
+                product=0x0000,
+                version=0x0003,
+            )
+        except PermissionError:
+            raise PermissionError(
+                "Cannot open /dev/uinput for writing.\n"
+                "Run the one-time setup script:\n"
+                "  sudo bash setup-uinput.sh\n"
+                "Then log out and back in for group changes to take effect."
+            ) from None
+        devnode = self._uinput.device.path
+        print(f"[rocm-racer] Virtual gamepad created: {devnode}")
+        # The kernel needs time to fully register the uinput device so that
+        # SDL3 can enumerate it when PCSX2 starts.
         time.sleep(self.settle_seconds)
+        print(f"[rocm-racer] Virtual gamepad ready (settled {self.settle_seconds}s).")
 
     def close(self) -> None:
         if self._uinput is None:
@@ -126,9 +155,14 @@ class VirtualGamepad:
         Push one frame of analog input.
 
         Args:
-            steering: [-1.0, 1.0] — negative = left, positive = right
-            throttle: [ 0.0, 1.0] — R2 pressure
-            brake:    [ 0.0, 1.0] — L2 pressure
+            steering: [-1.0, 1.0] — negative = left, positive = right → ABS_X
+            throttle: [ 0.0, 1.0] — right stick up   (SDL-0/-RightY) → ABS_RY
+            brake:    [ 0.0, 1.0] — right stick down  (SDL-0/+RightY) → ABS_RY
+
+        throttle and brake share the right stick Y axis. They are combined as
+        net = throttle - brake so they are mutually exclusive; full throttle
+        pushes the stick fully up (ABS_RY=0) and full brake pushes it fully
+        down (ABS_RY=255), with center (128) meaning no input.
         """
         if self._uinput is None:
             raise RuntimeError("VirtualGamepad is not open. Call open() first.")
@@ -136,16 +170,16 @@ class VirtualGamepad:
         steer_raw = int(_AXIS_CENTER + steering * (_AXIS_MAX - _AXIS_CENTER))
         steer_raw = max(_AXIS_MIN, min(_AXIS_MAX, steer_raw))
 
-        throttle_raw = int(throttle * _TRIGGER_MAX)
-        throttle_raw = max(_TRIGGER_MIN, min(_TRIGGER_MAX, throttle_raw))
-
-        brake_raw = int(brake * _TRIGGER_MAX)
-        brake_raw = max(_TRIGGER_MIN, min(_TRIGGER_MAX, brake_raw))
+        # net ∈ [-1, 1]: +1 = full throttle (stick up, ABS_RY→0)
+        #                 -1 = full brake    (stick down, ABS_RY→255)
+        net = float(throttle) - float(brake)
+        net = max(-1.0, min(1.0, net))
+        ry_raw = int(_AXIS_CENTER - net * _AXIS_CENTER)
+        ry_raw = max(_AXIS_MIN, min(_AXIS_MAX, ry_raw))
 
         ui = self._uinput
         ui.write(e.EV_ABS, e.ABS_X,  steer_raw)
-        ui.write(e.EV_ABS, e.ABS_RZ, throttle_raw)
-        ui.write(e.EV_ABS, e.ABS_Z,  brake_raw)
+        ui.write(e.EV_ABS, e.ABS_RY, ry_raw)
         ui.syn()
 
     def press_button(self, button: int, duration: float = 0.05) -> None:
@@ -158,6 +192,20 @@ class VirtualGamepad:
         time.sleep(duration)
         ui.write(e.EV_KEY, button, 0)
         ui.syn()
+
+    def hold_button(self, button: int) -> None:
+        """Hold a button down until release_button() is called."""
+        if self._uinput is None:
+            raise RuntimeError("VirtualGamepad is not open. Call open() first.")
+        self._uinput.write(e.EV_KEY, button, 1)
+        self._uinput.syn()
+
+    def release_button(self, button: int) -> None:
+        """Release a previously held button."""
+        if self._uinput is None:
+            return
+        self._uinput.write(e.EV_KEY, button, 0)
+        self._uinput.syn()
 
     def center(self) -> None:
         """Return all axes to their neutral/resting positions."""

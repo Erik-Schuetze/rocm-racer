@@ -17,6 +17,7 @@ SAVESTATES_DIR = REPO_ROOT / "savestates"
 PCSX2_BIN = Path("/usr/bin/pcsx2-qt")
 PCSX2_CONFIG_DIR = Path.home() / ".config" / "PCSX2"
 CONTROLLER_DB_PATH = PCSX2_CONFIG_DIR / "game_controller_db.txt"
+ISO_MAP = {
     "nfsu2": ISO_DIR / "Need for Speed - Underground 2 (USA, Canada).iso",
     "nfsmw": ISO_DIR / "Need for Speed - Most Wanted - Black Edition (USA).iso",
 }
@@ -63,29 +64,54 @@ def launch_pcsx2(iso: Path, statefile: Path | None = None) -> subprocess.Popen:
         cmd += ["-statefile", str(statefile)]
     cmd += ["--", str(iso)]
 
+    log_path = REPO_ROOT / "pcsx2.log"
+    log_fh = open(log_path, "w")
     print(f"[rocm-racer] Launching: {' '.join(cmd)}")
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"[rocm-racer] PCSX2 output → {log_path}")
+    return subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
 
 
-def wait_for_memory_map(pid: int, hint: str = "pcsx2", timeout: float = 60.0, poll: float = 0.5) -> None:
-    """Block until the PCSX2 virtual memory block appears in /proc/<pid>/maps."""
-    maps_path = f"/proc/{pid}/maps"
+def wait_for_pcsx2_ready(
+    timeout: float = 30.0,
+    poll: float = 0.25,
+    post_ready_delay: float = 2.0,
+) -> None:
+    """Block until PCSX2 has loaded the savestate and the game is running.
+
+    Monitors the PCSX2 emulog for the ``Opened gamepad`` marker, which
+    confirms that both the savestate has been restored **and** SDL has
+    connected the virtual gamepad.  After the marker is found a short
+    delay lets the game establish its baseline controller state before
+    any input is sent.
+
+    Falls back to a fixed timeout if the emulog is missing or the marker
+    never appears (e.g. when running without a virtual gamepad).
+    """
+    emulog = Path.home() / ".config" / "PCSX2" / "logs" / "emulog.txt"
     deadline = time.monotonic() + timeout
 
-    print(f"[rocm-racer] Waiting for PCSX2 memory map (pid={pid}, hint='{hint}')...")
+    print(f"[rocm-racer] Waiting for PCSX2 to finish initialisation (timeout={timeout}s)...")
+
     while time.monotonic() < deadline:
         try:
-            with open(maps_path, "r") as f:
-                if any(hint in line for line in f):
-                    print("[rocm-racer] Memory map ready.")
-                    return
+            text = emulog.read_text(errors="replace")
+            if "Opened gamepad" in text:
+                print("[rocm-racer] PCSX2 ready — gamepad connected by SDL.")
+                break
         except OSError:
             pass
         time.sleep(poll)
+    else:
+        print(
+            f"[rocm-racer] WARNING: readiness marker not found within {timeout}s — "
+            "proceeding anyway."
+        )
 
-    raise TimeoutError(
-        f"PCSX2 (pid={pid}) memory map with hint '{hint}' not found within {timeout}s."
-    )
+    # Give the game time to run a few frames and establish its baseline
+    # controller state so that the first input we send is a clean
+    # released→pressed transition rather than a pre-held button.
+    print(f"[rocm-racer] Post-init delay: {post_ready_delay}s for game to settle...")
+    time.sleep(post_ready_delay)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +146,7 @@ def train_ppo(env, total_timesteps: int, tensorboard_log: str | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="rocm-racer — NFS RL training launcher")
-    parser.add_argument("--game", choices=list(GAME_ISOS), default="nfsu2")
+    parser.add_argument("--game", choices=list(ISO_MAP), default="nfsu2")
     parser.add_argument("--statefile", type=Path, default=DEFAULT_STATEFILE)
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--tensorboard-log", type=str, default=None)
@@ -131,14 +157,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    iso = GAME_ISOS[args.game]
+    iso = ISO_MAP[args.game]
 
-    from memory_readers.keyboard_controller import KeyboardController
+    from memory_readers.virtual_gamepad import VirtualGamepad
+    from evdev import ecodes as e
 
     pcsx2_proc: subprocess.Popen | None = None
+    gamepad: VirtualGamepad | None = None
 
     def _shutdown(sig, frame):
         print("\n[rocm-racer] Shutting down...")
+        if gamepad is not None:
+            try:
+                gamepad.release_button(e.BTN_SOUTH)
+            except Exception:
+                pass
+            gamepad.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
         sys.exit(0)
@@ -146,20 +180,36 @@ def main() -> None:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    # 1. Write SDL3 controller DB so PCSX2 recognises the virtual gamepad.
+    write_controller_db()
+
+    # 2. Create the virtual gamepad BEFORE launching PCSX2.
+    #    SDL3 enumerates devices during SDL_InitSubSystem — the uinput device
+    #    must already exist at that point for reliable detection.
+    gamepad = VirtualGamepad()
+    gamepad.open()
+
+    # 3. Launch PCSX2 — it will find the gamepad during SDL init.
     if not args.no_launch:
         pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
-        wait_for_memory_map(pcsx2_proc.pid)
+        wait_for_pcsx2_ready()
 
+    # 4. Send accelerate input and hold it for testing.
+    #    The post-init delay in wait_for_pcsx2_ready ensures we send input
+    #    AFTER the savestate has fully loaded and the game is running, so
+    #    the game sees a clean released→pressed transition.
+    print("[rocm-racer] Test mode: accelerating (Cross + right stick up). Press Ctrl-C to stop.")
     try:
-        pid = pcsx2_proc.pid if pcsx2_proc else None
-        kbd = KeyboardController(pid=pid)
-        print("[rocm-racer] Test mode: pressing K (Cross/✕ = accelerate). Press Ctrl-C to stop.")
+        # Digital button: Cross = accelerate
+        gamepad.hold_button(e.BTN_SOUTH)
+        # Analog axis: right stick up = accelerate (belt-and-suspenders)
+        gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
         while True:
-            # K is the default PCSX2 keyboard binding for Cross (✕), which
-            # is the accelerate button in NFS Underground 2.
-            kbd.press("k", duration=0.1)
-            time.sleep(0.016)
+            time.sleep(1.0)
     finally:
+        if gamepad is not None:
+            gamepad.release_button(e.BTN_SOUTH)
+            gamepad.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
 

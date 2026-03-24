@@ -34,9 +34,21 @@ class PCSX2EnvConfig:
 
 @dataclass(frozen=True)
 class ControlAction:
-    steering: float
-    throttle: float
-    brake: float
+    # NFS Underground 2 PS2 control scheme (EA Black Box, NTSC-U)
+    # ------------------------------------------------------------
+    # Digital (test mode):
+    #   X       (BTN_SOUTH) = Accelerate
+    #   Circle  (BTN_EAST)  = Brake / Reverse
+    #   Square  (BTN_WEST)  = Handbrake
+    #   Triangle(BTN_NORTH) = Nitrous
+    # Analog (RL training via right stick Y, ABS_RY):
+    #   throttle [0,1] → right stick UP   (SDL-0/-RightY)
+    #   brake    [0,1] → right stick DOWN (SDL-0/+RightY)
+    #   VirtualGamepad.send() combines both onto ABS_RY (net = throttle - brake)
+    # NOTE: R2/L2 = shift up/down — never used for throttle/brake.
+    steering: float   # [-1.0, 1.0]  → ABS_X  left stick horizontal
+    throttle: float   # [ 0.0, 1.0]  → ABS_RY right stick up
+    brake: float      # [ 0.0, 1.0]  → ABS_RY right stick down
 
 
 class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
