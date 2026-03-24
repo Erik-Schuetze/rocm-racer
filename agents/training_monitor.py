@@ -88,8 +88,8 @@ class TrainingMonitorCallback(BaseCallback):
         self._last_reason = [""] * self._num_envs
 
         n_steps = getattr(self.model, "n_steps", "?")
-        print(f"[monitor] Rollout size: {n_steps} steps per gradient update"
-              f" ({self._num_envs} env{'s' if self._num_envs > 1 else ''})")
+        rollout_total = f"{n_steps} × {self._num_envs} = {n_steps * self._num_envs}" if self._num_envs > 1 else str(n_steps)
+        print(f"[monitor] Rollout size: {rollout_total} steps per gradient update")
         if self._preview:
             cv2.namedWindow("rocm-racer", cv2.WINDOW_NORMAL)
             cv2.resizeWindow(
@@ -144,8 +144,9 @@ class TrainingMonitorCallback(BaseCallback):
                 max_speed = max(self._ep_speeds[env_i]) if self._ep_speeds[env_i] else 0.0
 
                 n_steps = getattr(self.model, "n_steps", 2048)
-                rollout_pos = self.num_timesteps % n_steps
-                rollout_remaining = n_steps - rollout_pos if rollout_pos > 0 else 0
+                rollout_size = n_steps * self._num_envs
+                rollout_pos = self.num_timesteps % rollout_size
+                rollout_remaining = rollout_size - rollout_pos if rollout_pos > 0 else 0
 
                 total_eps = sum(self._ep_count)
                 env_tag = f"/e{env_i}" if self._num_envs > 1 else ""
