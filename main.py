@@ -680,7 +680,13 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         f"[rocm-racer] Telemetry logging started "
         f"(vehicle struct @ PS2 0x{vehicle_addr:08X}, {backend_info})"
     )
-    print("[rocm-racer] Press Ctrl-C to stop.\n")
+    print("[rocm-racer] Accelerating (Cross). Press Ctrl-C to stop.\n")
+
+    # Hold accelerate so the car moves and telemetry shows live data
+    if not args.no_launch:
+        from evdev import ecodes as e
+        gamepad.hold_button(e.BTN_SOUTH)
+        gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
 
     try:
         while True:
@@ -693,6 +699,12 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if not args.no_launch:
+            try:
+                gamepad.release_button(e.BTN_SOUTH)
+            except Exception:
+                pass
+            gamepad.close()
         reader.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
