@@ -420,7 +420,7 @@ def _phase1_find_speed_candidates(
 
     near_zero    = np.isfinite(f32_s) & (np.abs(f32_s) < 0.5)
     in_ms_range  = np.isfinite(f32_m) & (f32_m >= 15.0) & (f32_m <= 35.0)
-    in_kph_range = np.isfinite(f32_m) & (f32_m >= 75.0) & (f32_m <= 110.0)
+    in_kph_range = np.isfinite(f32_m) & (f32_m >= 60.0) & (f32_m <= 110.0)
 
     indices = np.where(near_zero & (in_ms_range | in_kph_range))[0]
     # Filter out kernel/BIOS area
