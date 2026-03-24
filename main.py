@@ -221,10 +221,11 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     ACCEL_TIME = 3.0
+    STEER_TIME = 0.2   # gentle left nudge for 3rd snapshot
 
-    print("[rocm-racer] ══════════════════════════════════════════════════════")
-    print("[rocm-racer]  Calibration — differential scan + quaternion anchoring")
-    print("[rocm-racer] ══════════════════════════════════════════════════════")
+    print("[rocm-racer] ══════════════════════════════════════════════════════════")
+    print("[rocm-racer]  Calibration — differential scan + 3-snapshot verification")
+    print("[rocm-racer] ══════════════════════════════════════════════════════════")
 
     write_controller_db()
     gamepad = VirtualGamepad()
@@ -238,26 +239,34 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     reader.open()
 
     try:
-        # ── Phase 1: differential scan (stopped → moving) ──
-        print("\n[calibrate] Phase 1: snapshot while stopped (car must be stationary)...")
+        # ── Phase 1: differential scan (stopped → straight → turning) ──
+        print("\n[calibrate] Phase 1a: snapshot while stopped (car must be stationary)...")
         snap_stopped = reader.snapshot_ee_ram()
 
-        print(f"[calibrate] Phase 1: accelerating for {ACCEL_TIME}s...")
+        print(f"[calibrate] Phase 1b: accelerating straight for {ACCEL_TIME}s...")
         gamepad.hold_button(e.BTN_SOUTH)
         gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
         time.sleep(ACCEL_TIME)
-        snap_moving = reader.snapshot_ee_ram()
+        snap_straight = reader.snapshot_ee_ram()
+
+        print(f"[calibrate] Phase 1c: gentle left steer ({STEER_TIME}s) + continued accel...")
+        gamepad.send(steering=-1.0, throttle=1.0, brake=0.0)
+        time.sleep(STEER_TIME)
+        gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+        # Let the car settle for a moment after the steer input
+        time.sleep(1.0)
+        snap_turned = reader.snapshot_ee_ram()
         gamepad.release_button(e.BTN_SOUTH)
         gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-        speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_moving)
+        speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_straight)
         print(f"[calibrate] Phase 1: {len(speed_candidates):,} speed-float candidates "
               f"(addresses ≥ 0x00100000)")
 
         if not speed_candidates:
             print("[calibrate] ERROR: No speed candidates found.")
             print("[calibrate]   Make sure the car is fully stopped before the scan,")
-            print("              then reaches >75 km/h during acceleration.")
+            print("              then reaches >60 km/h during acceleration.")
             return
 
         # ── Phase 2: score ALL candidates (quaternion + velocity + position) ──
@@ -277,17 +286,34 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 "pos_triplet": None,
             }
 
+            # Check the speed value in the turned snapshot — true scalar speed
+            # should still be in a reasonable range (not drop because direction changed)
+            f32_turned = np.frombuffer(snap_turned, dtype=np.float32)
+            turned_idx = speed_addr // 4
+            if turned_idx < len(f32_turned):
+                turned_val = float(f32_turned[turned_idx])
+                # If it's truly scalar speed, it should still be > 10 m/s or > 40 km/h
+                # after a gentle steer (the car is still accelerating)
+                if speed_unit == "m/s":
+                    if not (10.0 <= turned_val <= 50.0):
+                        continue  # not scalar speed — dropped after direction change
+                else:
+                    if not (40.0 <= turned_val <= 180.0):
+                        continue
+
             # Quaternion search (±0x400) — needs both snapshots to reject identity quats
-            quats = _phase2_quaternion_search(snap_stopped, snap_moving, speed_addr)
+            quats = _phase2_quaternion_search(snap_stopped, snap_straight, speed_addr)
             if quats:
                 result["quat_addr"] = quats[0][0]
                 result["quat_sq"]   = quats[0][1]
                 score += 3
 
             # Velocity + position triplet search (±0x200 around quaternion or speed)
+            # Uses all 3 snapshots for validation
             anchor = result["quat_addr"] if result["quat_addr"] is not None else speed_addr
             offsets_info = _phase3_discover_struct_offsets(
-                snap_stopped, snap_moving, speed_addr, speed_val, anchor, window=0x200
+                snap_stopped, snap_straight, snap_turned,
+                speed_addr, speed_val, anchor, window=0x200
             )
             if offsets_info["vel_triplets"]:
                 result["vel_triplet"] = offsets_info["vel_triplets"][0]
@@ -344,7 +370,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 
         # ── Phase 3: static pointer discovery ──
         print(f"\n[calibrate] Phase 3: searching for static pointer to 0x{best_speed_addr:08X}...")
-        static_ptrs = _phase4_find_static_pointers(snap_moving, best_speed_addr)
+        static_ptrs = _phase4_find_static_pointers(snap_straight, best_speed_addr)
 
         static_ptr_addr = 0
         if static_ptrs:
@@ -509,51 +535,65 @@ def _phase2_quaternion_search(
 
 def _phase3_discover_struct_offsets(
     data_stopped: bytes,
-    data_moving: bytes,
+    data_straight: bytes,
+    data_turned: bytes,
     speed_addr: int,
     speed_val: float,
     quat_addr: int,
-    window: int = 0x100,
+    window: int = 0x200,
 ) -> dict:
-    """Phase 3: empirically discover position and velocity offsets.
+    """Phase 3: empirically discover position and velocity offsets using 3 snapshots.
 
-    Scans ±window around the quaternion anchor for:
+    Uses stopped/straight/turned snapshots to validate candidates:
     - Velocity: 3 consecutive floats near-zero when stopped, with magnitude
-      roughly matching speed_val when moving (within 2x tolerance)
-    - Position: 3 consecutive floats with world-scale values (1-100000) in
-      both snapshots, where the horizontal distance changed (car moved)
-      but the values didn't teleport (< 1000m change in 3 seconds)
+      roughly matching speed_val in BOTH moving snapshots.  Each individual
+      component must not exceed scalar speed (impossible for a projection).
+      Velocity triplet must NOT overlap with speed_addr.
+    - Position: 3 consecutive floats with world-scale values, where movement
+      is smooth between all snapshot pairs (no teleportation jumps).
 
-    Returns dict with vel_triplets, pos_triplets, and raw candidate lists.
+    Returns dict with vel_triplets, pos_triplets.
     """
     import math
     from memory_readers.nfsu2_memory import _EE_RAM_SIZE
 
     f32_s = np.frombuffer(data_stopped, dtype=np.float32)
-    f32_m = np.frombuffer(data_moving, dtype=np.float32)
+    f32_m = np.frombuffer(data_straight, dtype=np.float32)
+    f32_t = np.frombuffer(data_turned, dtype=np.float32)
 
     start = max(0, quat_addr - window) & ~3
     end   = min(_EE_RAM_SIZE - 4, quat_addr + window)
 
-    vel_candidates: list[tuple[int, float, float]] = []
-    pos_candidates: list[tuple[int, float, float]] = []
+    # Get the speed value in the turned snapshot for velocity validation
+    speed_idx = speed_addr // 4
+    speed_turned = float(f32_t[speed_idx]) if speed_idx < len(f32_t) else speed_val
+
+    vel_candidates: list[tuple[int, float, float, float]] = []  # addr, stopped, straight, turned
+    pos_candidates: list[tuple[int, float, float, float]] = []
 
     for byte_off in range(start, end, 4):
         idx = byte_off // 4
-        if idx >= len(f32_s) or idx >= len(f32_m):
+        if idx >= len(f32_s) or idx >= len(f32_m) or idx >= len(f32_t):
             break
         vs = float(f32_s[idx])
         vm = float(f32_m[idx])
-        if not (math.isfinite(vs) and math.isfinite(vm)):
+        vt = float(f32_t[idx])
+        if not (math.isfinite(vs) and math.isfinite(vm) and math.isfinite(vt)):
             continue
-        # Velocity: near 0 stopped, meaningful while moving
-        if abs(vs) < 0.1 and abs(vm) > 0.5:
-            vel_candidates.append((byte_off, vs, vm))
-        # Position: world-scale, both finite, changed but not teleported
-        if 1.0 < abs(vs) < 100_000 and 1.0 < abs(vm) < 100_000:
-            delta = abs(vm - vs)
-            if delta < 1000:  # < 1km change in 3s of driving is realistic
-                pos_candidates.append((byte_off, vs, vm))
+
+        # Velocity candidate: near 0 stopped, meaningful while moving in BOTH snapshots
+        if abs(vs) < 0.1 and abs(vm) > 0.5 and abs(vt) > 0.5:
+            # Each component must not exceed scalar speed * 1.2
+            if abs(vm) <= speed_val * 1.2 and abs(vt) <= speed_turned * 1.2:
+                vel_candidates.append((byte_off, vs, vm, vt))
+
+        # Position candidate: world-scale, both finite, changed but not teleported
+        if 1.0 < abs(vs) < 100_000 and 1.0 < abs(vm) < 100_000 and 1.0 < abs(vt) < 100_000:
+            delta_sm = abs(vm - vs)
+            delta_mt = abs(vt - vm)
+            # Both deltas should be < 500m (reasonable for 3s + 1.2s of driving)
+            if delta_sm < 500 and delta_mt < 500:
+                pos_candidates.append((byte_off, vs, vm, vt))
 
     def _triplets(addrs: list[int]) -> list[tuple[int, int, int]]:
         out = []
@@ -563,40 +603,72 @@ def _phase3_discover_struct_offsets(
                 out.append((a, b, c))
         return out
 
-    # Filter velocity triplets: magnitude should be within 0.3x–3x of speed
-    vel_triplets_raw = _triplets(sorted(a for a, _, _ in vel_candidates))
-    vel_lookup = {a: (vs, vm) for a, vs, vm in vel_candidates}
+    # ---- Velocity triplet validation ----
+    vel_triplets_raw = _triplets(sorted(a for a, _, _, _ in vel_candidates))
+    vel_lookup = {a: (vs, vm, vt) for a, vs, vm, vt in vel_candidates}
     vel_triplets_scored: list[tuple[tuple[int, int, int], float]] = []
 
     for tri in vel_triplets_raw:
-        vx = vel_lookup.get(tri[0], (0, 0))[1]
-        vy = vel_lookup.get(tri[1], (0, 0))[1]
-        vz = vel_lookup.get(tri[2], (0, 0))[1]
-        mag = math.sqrt(vx*vx + vy*vy + vz*vz)
-        if speed_val > 0:
-            ratio = mag / speed_val
-            if 0.3 < ratio < 3.0:
-                vel_triplets_scored.append((tri, abs(ratio - 1.0)))
+        # Reject triplets overlapping with speed_addr
+        if any(addr == speed_addr for addr in tri):
+            continue
+
+        # Get values in straight snapshot
+        vals_m = [vel_lookup.get(a, (0, 0, 0))[1] for a in tri]
+        mag_m = math.sqrt(sum(v*v for v in vals_m))
+
+        # Get values in turned snapshot
+        vals_t = [vel_lookup.get(a, (0, 0, 0))[2] for a in tri]
+        mag_t = math.sqrt(sum(v*v for v in vals_t))
+
+        # Magnitude should be close to scalar speed in BOTH moving snapshots
+        if speed_val > 0 and speed_turned > 0:
+            ratio_m = mag_m / speed_val
+            ratio_t = mag_t / speed_turned
+            # Tighter tolerance: 0.7x–1.5x of scalar speed
+            if 0.7 < ratio_m < 1.5 and 0.7 < ratio_t < 1.5:
+                # Score: prefer close to 1.0 in both
+                score = abs(ratio_m - 1.0) + abs(ratio_t - 1.0)
+                vel_triplets_scored.append((tri, score))
 
     vel_triplets_scored.sort(key=lambda x: x[1])
     vel_triplets = [t for t, _ in vel_triplets_scored]
 
-    # Filter position triplets: at least 2 of 3 components should have changed
-    pos_triplets_raw = _triplets(sorted(a for a, _, _ in pos_candidates))
-    pos_lookup = {a: (vs, vm) for a, vs, vm in pos_candidates}
+    # ---- Position triplet validation ----
+    pos_triplets_raw = _triplets(sorted(a for a, _, _, _ in pos_candidates))
+    pos_lookup = {a: (vs, vm, vt) for a, vs, vm, vt in pos_candidates}
     pos_triplets_scored: list[tuple[tuple[int, int, int], float]] = []
 
     for tri in pos_triplets_raw:
-        deltas = []
+        # Compute 3D displacement stopped→straight and straight→turned
+        deltas_sm = []
+        deltas_mt = []
         for addr in tri:
-            vs, vm = pos_lookup.get(addr, (0, 0))
-            deltas.append(abs(vm - vs))
-        changed = sum(1 for d in deltas if d > 0.5)
-        if changed >= 2:
-            total_dist = math.sqrt(sum(d*d for d in deltas))
-            # Prefer moderate movement (1–200m in 3s is realistic)
-            if 1.0 < total_dist < 500:
-                pos_triplets_scored.append((tri, abs(total_dist - 50)))
+            vs, vm, vt = pos_lookup.get(addr, (0, 0, 0))
+            deltas_sm.append(vm - vs)
+            deltas_mt.append(vt - vm)
+        dist_sm = math.sqrt(sum(d*d for d in deltas_sm))
+        dist_mt = math.sqrt(sum(d*d for d in deltas_mt))
+
+        changed_sm = sum(1 for d in deltas_sm if abs(d) > 0.5)
+        changed_mt = sum(1 for d in deltas_mt if abs(d) > 0.5)
+        if changed_sm < 2:
+            continue
+
+        # Both displacements should be moderate (1–300m), not teleportation
+        if not (1.0 < dist_sm < 300 and 0.5 < dist_mt < 200):
+            continue
+
+        # The ratio of displacement to expected travel should be reasonable
+        # At ~20 m/s for 3s → ~60m, then ~25 m/s for 1.2s → ~30m
+        expected_sm = speed_val * 3.0  # rough expected distance
+        ratio_sm = dist_sm / expected_sm if expected_sm > 1 else 999
+        if not (0.3 < ratio_sm < 3.0):
+            continue
+
+        # Score: prefer ratios close to 1.0 and movement in both phases
+        score = abs(ratio_sm - 1.0)
+        pos_triplets_scored.append((tri, score))
 
     pos_triplets_scored.sort(key=lambda x: x[1])
     pos_triplets = [t for t, _ in pos_triplets_scored]
@@ -604,8 +676,6 @@ def _phase3_discover_struct_offsets(
     return {
         "vel_triplets": vel_triplets,
         "pos_triplets": pos_triplets,
-        "vel_candidates": vel_candidates[:20],
-        "pos_candidates": pos_candidates[:20],
     }
 
 
@@ -800,7 +870,10 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
         from memory_readers.virtual_gamepad import VirtualGamepad
         gamepad = VirtualGamepad()
         gamepad.open()
-        pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
+        # Use calibration savestate (with gauge visible) so the speedometer
+        # can be visually compared against telemetry readings.
+        statefile = args.statefile if args.statefile != DEFAULT_STATEFILE else CALIBRATION_STATEFILE
+        pcsx2_proc = launch_pcsx2(iso, statefile=statefile)
         wait_for_pcsx2_ready()
 
     reader.open()
