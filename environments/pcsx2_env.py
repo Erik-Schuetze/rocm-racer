@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -16,12 +18,9 @@ from memory_readers.virtual_gamepad import VirtualGamepad
 @dataclass(frozen=True)
 class RewardConfig:
     target_speed_kph: float = 100.0
-    speed_weight: float = 2.0
-    progress_weight: float = 10.0
-    collision_penalty: float = -25.0
-    reverse_penalty: float = -15.0
-    zero_speed_penalty: float = -5.0
-    zero_speed_threshold_kph: float = 1.0
+    speed_weight: float = 2.0        # per-step speed reward scale (max = speed_weight)
+    crash_penalty: float = -25.0     # applied when crash is detected
+    success_bonus: float = 50.0      # applied when distance > success_distance_m
 
 
 @dataclass(frozen=True)
@@ -30,25 +29,27 @@ class PCSX2EnvConfig:
     max_episode_steps: int = 2_000
     device: str = "cuda"
     reward: RewardConfig = field(default_factory=RewardConfig)
+    savestate_slot: int = 0
+    savestate_settle_s: float = 1.0  # wait time after load_state() before reading
+    # Termination thresholds
+    slow_speed_threshold_kph: float = 30.0
+    slow_speed_timeout_s: float = 3.0
+    success_distance_m: float = 1000.0
+    # Crash detection: speed drop within this window triggers crash penalty
+    crash_decel_window_s: float = 1.0
+    crash_decel_threshold_kph: float = 30.0
 
 
 @dataclass(frozen=True)
 class ControlAction:
     # NFS Underground 2 PS2 control scheme (EA Black Box, NTSC-U)
     # ------------------------------------------------------------
-    # Digital (test mode):
-    #   X       (BTN_SOUTH) = Accelerate
-    #   Circle  (BTN_EAST)  = Brake / Reverse
-    #   Square  (BTN_WEST)  = Handbrake
-    #   Triangle(BTN_NORTH) = Nitrous
-    # Analog (RL training via right stick Y, ABS_RY):
-    #   throttle [0,1] → right stick UP   (SDL-0/-RightY)
-    #   brake    [0,1] → right stick DOWN (SDL-0/+RightY)
-    #   VirtualGamepad.send() combines both onto ABS_RY (net = throttle - brake)
-    # NOTE: R2/L2 = shift up/down — never used for throttle/brake.
-    steering: float   # [-1.0, 1.0]  → ABS_X  left stick horizontal
-    throttle: float   # [ 0.0, 1.0]  → ABS_RY right stick up
-    brake: float      # [ 0.0, 1.0]  → ABS_RY right stick down
+    # Analog RL inputs:
+    #   steering    [-1.0, 1.0]  → ABS_X  left stick horizontal
+    #   accel_brake [-1.0, 1.0]  → ABS_RY right stick Y
+    #     > 0 = throttle (stick up), < 0 = brake (stick down)
+    steering: float     # [-1.0, 1.0]
+    accel_brake: float  # [-1.0, 1.0]  (+throttle / -brake)
 
 
 class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -71,12 +72,12 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self.device = torch.device(self.config.device)
 
         self.action_space = spaces.Box(
-            low=np.asarray([-1.0, 0.0, 0.0], dtype=np.float32),
-            high=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.asarray([-1.0, -1.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
-        # Telemetry-only observation: [speed_kph, x, y, z, track_progress]
+        # Telemetry observation: [speed_kph, x, y, z, track_progress]
         telemetry_space = spaces.Box(
             low=np.asarray(
                 [0.0, -1_000_000.0, -1_000_000.0, -1_000_000.0, 0.0],
@@ -101,67 +102,111 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps = 0
         self._last_telemetry: TelemetrySample | None = None
 
+        # Episode state for termination tracking
+        self._start_position: tuple[float, float, float] | None = None
+        self._slow_speed_elapsed: float = 0.0
+        # Speed history deque for crash detection (stores (timestamp, speed_kph) tuples)
+        _history_len = max(
+            2,
+            int(self.config.crash_decel_window_s / self.config.step_interval_seconds) + 2,
+        )
+        self._speed_history: deque[tuple[float, float]] = deque(maxlen=_history_len)
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+
     def reset(
         self,
         *,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[np.ndarray | dict, dict[str, Any]]:
         super().reset(seed=seed)
         del options
 
         self.memory_reader.open()
         self.gamepad.open()
         self.gamepad.center()
+
+        # Reload savestate for a clean episode
+        self.memory_reader.load_state(self.config.savestate_slot)
+        self.sleep_fn(self.config.savestate_settle_s)
+
+        # Reset all episode tracking state
         self._episode_steps = 0
+        self._slow_speed_elapsed = 0.0
+        self._speed_history.clear()
+
         self._last_telemetry = self.memory_reader.read_telemetry()
+        self._start_position = self._last_telemetry.position
+        self._speed_history.append((time.monotonic(), self._last_telemetry.speed_kph))
 
-        if self.frame_capture is not None:
-            self.frame_capture.reset_stack()
-            image = self.frame_capture.step()
-            observation = {
-                "image": image,
-                "telemetry": self._last_telemetry.as_observation(),
-            }
-        else:
-            observation = self._last_telemetry.as_observation()
+        obs = self._build_obs(self._last_telemetry, reset=True)
+        info = self._build_info(self._last_telemetry, reward=0.0, reward_terms={},
+                                distance=0.0, terminated_reason="")
+        return obs, info
 
-        info = self._build_info(self._last_telemetry, reward=0.0, reward_terms={})
-        return observation, info
-
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        clipped_action = np.asarray(action, dtype=np.float32).clip(
+    def step(
+        self, action: np.ndarray
+    ) -> tuple[np.ndarray | dict, float, bool, bool, dict[str, Any]]:
+        clipped = np.asarray(action, dtype=np.float32).clip(
             self.action_space.low, self.action_space.high
         )
         control = ControlAction(
-            steering=float(clipped_action[0]),
-            throttle=float(clipped_action[1]),
-            brake=float(clipped_action[2]),
+            steering=float(clipped[0]),
+            accel_brake=float(clipped[1]),
         )
-
         self._apply_action(control)
         self.sleep_fn(self.config.step_interval_seconds)
 
         telemetry = self.memory_reader.read_telemetry()
-        reward, reward_terms = self._calculate_reward(telemetry)
-
+        now = time.monotonic()
+        self._speed_history.append((now, telemetry.speed_kph))
         self._episode_steps += 1
-        terminated = bool(telemetry.wall_collision_flag)
-        truncated = self._episode_steps >= self.config.max_episode_steps
 
-        if self.frame_capture is not None:
-            image = self.frame_capture.step()
-            observation = {
-                "image": image,
-                "telemetry": telemetry.as_observation(),
-            }
+        # --- Compute per-step reward ---
+        speed_term = self.config.reward.speed_weight * min(
+            telemetry.speed_kph / self.config.reward.target_speed_kph, 1.0
+        )
+        reward_terms: dict[str, float] = {"speed": speed_term}
+
+        # --- Crash detection ---
+        crash = self._detect_crash(now)
+        if crash:
+            reward_terms["crash"] = self.config.reward.crash_penalty
+
+        # --- Distance from start ---
+        distance = self._euclidean_distance(telemetry.position)
+
+        # --- Termination conditions ---
+        terminated = False
+        terminated_reason = ""
+
+        if crash:
+            terminated = True
+            terminated_reason = "crash"
+        elif distance >= self.config.success_distance_m:
+            terminated = True
+            terminated_reason = "success"
+            reward_terms["success"] = self.config.reward.success_bonus
         else:
-            observation = telemetry.as_observation()
+            # Slow-speed timeout
+            if telemetry.speed_kph < self.config.slow_speed_threshold_kph:
+                self._slow_speed_elapsed += self.config.step_interval_seconds
+            else:
+                self._slow_speed_elapsed = 0.0
+            if self._slow_speed_elapsed >= self.config.slow_speed_timeout_s:
+                terminated = True
+                terminated_reason = "slow_timeout"
 
-        info = self._build_info(telemetry, reward=reward, reward_terms=reward_terms)
+        truncated = (not terminated) and (self._episode_steps >= self.config.max_episode_steps)
+        reward = float(sum(reward_terms.values()))
+
+        obs = self._build_obs(telemetry)
+        info = self._build_info(telemetry, reward=reward, reward_terms=reward_terms,
+                                distance=distance, terminated_reason=terminated_reason)
 
         self._last_telemetry = telemetry
-        return observation, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info
 
     def close(self) -> None:
         self.gamepad.close()
@@ -169,49 +214,51 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         if self.frame_capture is not None:
             self.frame_capture.close()
 
-    def observation_tensor(self, telemetry: TelemetrySample | None = None) -> torch.Tensor:
-        sample = telemetry or self._last_telemetry
-        if sample is None:
-            raise RuntimeError("No telemetry is available yet. Call reset() first.")
-        return torch.as_tensor(sample.as_observation(), device=self.device)
+    # ── internals ─────────────────────────────────────────────────────────
 
     def _apply_action(self, action: ControlAction) -> None:
+        ab = action.accel_brake
         self.gamepad.send(
             steering=action.steering,
-            throttle=action.throttle,
-            brake=action.brake,
+            throttle=max(0.0, ab),
+            brake=max(0.0, -ab),
         )
 
-    def _calculate_reward(self, telemetry: TelemetrySample) -> tuple[float, dict[str, float]]:
-        reward_cfg = self.config.reward
-        previous_progress = (
-            self._last_telemetry.track_progress if self._last_telemetry is not None else telemetry.track_progress
-        )
-        progress_delta = telemetry.track_progress - previous_progress
+    def _detect_crash(self, now: float) -> bool:
+        """True if speed dropped > crash_decel_threshold_kph in the past crash_decel_window_s."""
+        if len(self._speed_history) < 2:
+            return False
+        window = self.config.crash_decel_window_s
+        current_speed = self._speed_history[-1][1]
+        for t, spd in self._speed_history:
+            if (now - t) <= window:
+                if (spd - current_speed) >= self.config.crash_decel_threshold_kph:
+                    return True
+        return False
 
-        speed_term = reward_cfg.speed_weight * min(
-            telemetry.speed_kph / reward_cfg.target_speed_kph,
-            1.0,
-        )
-        progress_term = reward_cfg.progress_weight * progress_delta
-        collision_term = (
-            reward_cfg.collision_penalty if telemetry.wall_collision_flag else 0.0
-        )
-        reverse_term = reward_cfg.reverse_penalty if telemetry.reverse_flag else 0.0
-        zero_speed_term = (
-            reward_cfg.zero_speed_penalty
-            if abs(telemetry.speed_kph) <= reward_cfg.zero_speed_threshold_kph
-            else 0.0
-        )
+    def _euclidean_distance(self, pos: tuple[float, float, float]) -> float:
+        """Euclidean distance from episode start position."""
+        if self._start_position is None:
+            return 0.0
+        dx = pos[0] - self._start_position[0]
+        dy = pos[1] - self._start_position[1]
+        dz = pos[2] - self._start_position[2]
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
 
-        reward_terms = {
-            "speed": speed_term,
-            "progress": progress_term,
-            "collision": collision_term,
-            "reverse": reverse_term,
-            "zero_speed": zero_speed_term,
-        }
-        return float(sum(reward_terms.values())), reward_terms
+    def _build_obs(
+        self,
+        telemetry: TelemetrySample,
+        reset: bool = False,
+    ) -> np.ndarray | dict:
+        if self.frame_capture is not None:
+            if reset:
+                self.frame_capture.reset_stack()
+            image = self.frame_capture.step()
+            return {
+                "image": image,
+                "telemetry": telemetry.as_observation(),
+            }
+        return telemetry.as_observation()
 
     def _build_info(
         self,
@@ -219,6 +266,8 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         *,
         reward: float,
         reward_terms: dict[str, float],
+        distance: float,
+        terminated_reason: str,
     ) -> dict[str, Any]:
         return {
             "device": str(self.device),
@@ -226,8 +275,9 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             "speed_kph": telemetry.speed_kph,
             "position": telemetry.position,
             "track_progress": telemetry.track_progress,
-            "reverse_flag": telemetry.reverse_flag,
-            "wall_collision_flag": telemetry.wall_collision_flag,
+            "distance_from_start": distance,
+            "terminated_reason": terminated_reason,
+            "slow_speed_elapsed": self._slow_speed_elapsed,
             "reward": reward,
             "reward_terms": reward_terms,
         }

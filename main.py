@@ -163,6 +163,12 @@ def parse_args() -> argparse.Namespace:
                         help="Clear the candidate list and start fresh")
     parser.add_argument("--vision", action="store_true",
                         help="Test frame capture pipeline (PipeWire portal, saves sample frame)")
+    parser.add_argument("--train", action="store_true",
+                        help="Run PPO training loop (requires calibration)")
+    parser.add_argument("--checkpoint-freq", type=int, default=10_000,
+                        help="Save a model checkpoint every N timesteps (default: 10000)")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="PyTorch device for training (default: cuda)")
     return parser.parse_args()
 
 
@@ -203,6 +209,11 @@ def main() -> None:
     # --- Vision test mode: capture frames from PCSX2 ---
     if args.vision:
         _run_vision(args, iso)
+        return
+
+    # --- Training mode: PPO ---
+    if args.train:
+        _run_train(args, iso)
         return
 
     # --- Default: test mode (gamepad accelerate) ---
@@ -1007,6 +1018,128 @@ def _run_vision(args: argparse.Namespace, iso: Path) -> None:
         fc.close()
         if not args.no_launch:
             gamepad.close()
+        if pcsx2_proc is not None:
+            pcsx2_proc.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Mode: --train
+# ---------------------------------------------------------------------------
+
+def _run_train(args: argparse.Namespace, iso: Path) -> None:
+    """
+    PPO training loop.
+
+    Launches PCSX2, wires the multimodal PCSX2RacerEnv, then runs
+    stable-baselines3 PPO with the MultimodalExtractor feature extractor.
+
+    Episode reset: PINE save_state(0) is called once after launch; subsequent
+    episode resets call load_state(0) for fast in-place reloads.
+    """
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import CheckpointCallback
+
+    from agents.feature_extractor import MultimodalExtractor
+    from environments.pcsx2_env import PCSX2EnvConfig, PCSX2RacerEnv
+    from memory_readers.frame_capture import FrameCapture, FrameCaptureConfig
+    from memory_readers.nfsu2_memory import NFSU2MemoryReader
+    from memory_readers.virtual_gamepad import VirtualGamepad
+
+    pcsx2_proc: subprocess.Popen | None = None
+
+    write_controller_db()
+    gamepad = VirtualGamepad()
+    gamepad.open()
+
+    pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
+    wait_for_pcsx2_ready()
+
+    # Connect PINE and verify calibration
+    reader = NFSU2MemoryReader()
+    reader.open()
+    if not reader.is_calibrated():
+        print(
+            "[rocm-racer] ERROR: No calibration data found.\n"
+            "  Run:  python main.py --calibrate",
+            file=sys.stderr,
+        )
+        gamepad.close()
+        pcsx2_proc.terminate()
+        sys.exit(1)
+
+    # Save initial state to slot 0 (enables fast load_state(0) resets)
+    print("[train] Saving initial state to slot 0 for episode resets...")
+    reader.save_state(0)
+    time.sleep(0.5)
+
+    # Frame capture
+    fc = FrameCapture(FrameCaptureConfig())
+    fc.open()
+
+    # Build environment
+    env_config = PCSX2EnvConfig(device=args.device)
+    env = PCSX2RacerEnv(
+        memory_reader=reader,
+        gamepad=gamepad,
+        config=env_config,
+        frame_capture=fc,
+    )
+
+    # PPO with multimodal feature extractor
+    policy_kwargs = dict(
+        features_extractor_class=MultimodalExtractor,
+        features_extractor_kwargs=dict(features_dim=512),
+    )
+
+    models_dir = REPO_ROOT / "models"
+    models_dir.mkdir(exist_ok=True)
+    tb_log = args.tensorboard_log or str(REPO_ROOT / "runs")
+
+    checkpoint_cb = CheckpointCallback(
+        save_freq=args.checkpoint_freq,
+        save_path=str(models_dir),
+        name_prefix="ppo_nfsu2",
+        verbose=1,
+    )
+
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        verbose=1,
+        tensorboard_log=tb_log,
+        device=env_config.device,
+    )
+
+    print(f"[train] Starting PPO training for {args.timesteps:,} timesteps...")
+    print(f"[train] Checkpoints → {models_dir}/")
+    print(f"[train] TensorBoard → {tb_log}")
+    print("[train] Press Ctrl-C to stop and save final model.\n")
+
+    try:
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=checkpoint_cb,
+            tb_log_name="ppo_nfsu2",
+            reset_num_timesteps=True,
+        )
+    except KeyboardInterrupt:
+        print("\n[train] Interrupted — saving final model...")
+    finally:
+        final_path = str(models_dir / "ppo_nfsu2_final")
+        model.save(final_path)
+        print(f"[train] Final model saved → {final_path}.zip")
+        env.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
 

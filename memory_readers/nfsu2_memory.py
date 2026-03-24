@@ -231,6 +231,16 @@ class NFSU2MemoryReader:
         """Return True if speed address is known (minimum viable calibration)."""
         return self._speed_addr != 0
 
+    def save_state(self, slot: int = 0) -> None:
+        """Save current emulator state to slot (0-9) via PINE IPC."""
+        self.open()
+        self._pine.save_state(slot)
+
+    def load_state(self, slot: int = 0) -> None:
+        """Reload emulator savestate from slot (0-9) via PINE IPC."""
+        self.open()
+        self._pine.load_state(slot)
+
     def read_telemetry(self) -> TelemetrySample:
         self.open()
         if not self.is_calibrated():
