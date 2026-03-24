@@ -208,6 +208,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run PCSX2 at 2× speed to accelerate training")
     parser.add_argument("--num-envs", type=int, default=1,
                         help="Number of parallel PCSX2 environments (default: 1)")
+    parser.add_argument("--load-model", type=Path, default=None, metavar="PATH",
+                        help="Load a saved model (.zip) and resume training from it")
     return parser.parse_args()
 
 
@@ -1203,10 +1205,13 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     models_dir.mkdir(exist_ok=True)
     tb_log = args.tensorboard_log or str(REPO_ROOT / "runs")
 
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"ppo_nfsu2_{run_tag}"
+
     checkpoint_cb = CheckpointCallback(
         save_freq=args.checkpoint_freq,
         save_path=str(models_dir),
-        name_prefix="ppo_nfsu2",
+        name_prefix=run_prefix,
         verbose=1,
     )
 
@@ -1218,25 +1223,42 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
 
     callbacks = CallbackList([checkpoint_cb, monitor_cb])
 
-    model = PPO(
-        "MultiInputPolicy",
-        vec_env,
-        policy_kwargs=policy_kwargs,
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        verbose=1,
-        tensorboard_log=tb_log,
-        device=env_config.device,
-    )
+    if args.load_model:
+        model_path = Path(args.load_model)
+        if not model_path.exists():
+            print(f"[train] ERROR: model not found: {model_path}")
+            sys.exit(1)
+        model = PPO.load(
+            model_path,
+            env=vec_env,
+            device=env_config.device,
+            tensorboard_log=tb_log,
+        )
+        reset_timesteps = False
+        print(f"[train] Loaded model from {model_path}")
+    else:
+        model = PPO(
+            "MultiInputPolicy",
+            vec_env,
+            policy_kwargs=policy_kwargs,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            verbose=1,
+            tensorboard_log=tb_log,
+            device=env_config.device,
+        )
+        reset_timesteps = True
+        print("[train] Created new model")
 
     print(f"[train] Starting PPO training for {args.timesteps:,} timesteps...")
+    print(f"[train] Run tag: {run_tag}")
     print(f"[train] Environments: {num_envs}")
-    print(f"[train] Checkpoints → {models_dir}/")
+    print(f"[train] Checkpoints → {models_dir}/{run_prefix}_*_steps.zip")
     print(f"[train] TensorBoard → {tb_log}")
     if not args.no_preview:
         print("[train] Preview window: 'rocm-racer' (green=steering, red=accel/brake)")
@@ -1247,12 +1269,12 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             total_timesteps=args.timesteps,
             callback=callbacks,
             tb_log_name="ppo_nfsu2",
-            reset_num_timesteps=True,
+            reset_num_timesteps=reset_timesteps,
         )
     except KeyboardInterrupt:
         print("\n[train] Interrupted — saving final model...")
     finally:
-        final_path = str(models_dir / "ppo_nfsu2_final")
+        final_path = str(models_dir / f"{run_prefix}_final")
         model.save(final_path)
         print(f"[train] Final model saved → {final_path}.zip")
         vec_env.close()
