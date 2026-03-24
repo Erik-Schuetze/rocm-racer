@@ -17,8 +17,7 @@ from memory_readers.virtual_gamepad import VirtualGamepad
 
 @dataclass(frozen=True)
 class RewardConfig:
-    target_speed_kph: float = 100.0
-    speed_weight: float = 2.0        # per-step speed reward scale (max = speed_weight)
+    speed_weight: float = 0.02       # per-step: reward = speed_kph * speed_weight (uncapped)
     crash_penalty: float = -25.0     # applied when crash is detected
     success_bonus: float = 50.0      # applied when distance > success_distance_m
 
@@ -164,9 +163,9 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps += 1
 
         # --- Compute per-step reward ---
-        speed_term = self.config.reward.speed_weight * min(
-            telemetry.speed_kph / self.config.reward.target_speed_kph, 1.0
-        )
+        # Linear speed reward: faster = always better, no ceiling.
+        # At 100 km/h → +2.0/step, at 150 km/h → +3.0/step.
+        speed_term = self.config.reward.speed_weight * telemetry.speed_kph
         reward_terms: dict[str, float] = {"speed": speed_term}
 
         # --- Crash detection ---
