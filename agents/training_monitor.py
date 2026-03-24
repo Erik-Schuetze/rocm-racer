@@ -20,8 +20,9 @@ import time
 from typing import Any
 
 # OpenCV ships its own Qt that only has the XCB (X11) plugin.
-# Force it before cv2 is imported to avoid a crash on Wayland sessions.
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+# On Wayland sessions QT_QPA_PLATFORM is typically set to "wayland",
+# which crashes cv2. Force xcb before cv2 is imported.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import cv2
 import numpy as np
