@@ -1179,7 +1179,9 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             gamepads.append(gamepad)
 
             # 2. Launch this instance's PCSX2
-            instance_mgr.launch_instance(cfg, turbo=args.turbo)
+            instance_mgr.launch_instance(
+                cfg, turbo=args.turbo, gamepad_device=gamepad.device_path,
+            )
             instance_mgr.wait_for_instance(cfg)
 
             # 3. Connect PINE to this instance's socket

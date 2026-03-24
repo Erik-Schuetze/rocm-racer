@@ -140,7 +140,12 @@ class InstanceManager:
 
     # ── launch ─────────────────────────────────────────────────────────────
 
-    def launch_instance(self, cfg: InstanceConfig, turbo: bool = False) -> None:
+    def launch_instance(
+        self,
+        cfg: InstanceConfig,
+        turbo: bool = False,
+        gamepad_device: str | None = None,
+    ) -> None:
         """Launch one PCSX2 process with isolated env vars."""
         # Patch speed scalar in per-instance INI if turbo requested
         if turbo:
@@ -165,6 +170,9 @@ class InstanceManager:
             "XDG_CONFIG_HOME": str(cfg.config_dir),
             "XDG_RUNTIME_DIR": str(cfg.runtime_dir),
         }
+        # Restrict SDL to only see this instance's gamepad
+        if gamepad_device:
+            env["SDL_JOYSTICK_DEVICE"] = gamepad_device
 
         log_path = self.base_dir / f"env-{cfg.instance_id}" / "pcsx2.log"
         log_fh = open(log_path, "w")

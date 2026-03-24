@@ -136,6 +136,13 @@ class VirtualGamepad:
         time.sleep(self.settle_seconds)
         print(f"[rocm-racer] Virtual gamepad ready (settled {self.settle_seconds}s).")
 
+    @property
+    def device_path(self) -> str | None:
+        """Return the /dev/input/eventXX path of this virtual gamepad."""
+        if self._uinput is None:
+            return None
+        return self._uinput.device.path
+
     def close(self) -> None:
         if self._uinput is None:
             return
