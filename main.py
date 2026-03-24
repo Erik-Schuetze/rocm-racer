@@ -251,9 +251,9 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from memory_readers.virtual_gamepad import VirtualGamepad
     from evdev import ecodes as e
 
-    BRAKE_TIME = 3.0     # seconds to hold brake (ensure car stops)
+    BRAKE_TIME = 3.0     # seconds to hold brake (decelerate, not reverse)
+    COAST_TIME = 5.0     # seconds to wait with no input for car to reach 0
     ACCEL_TIME = 5.0     # seconds to hold accelerate
-    STOP_TIME = 4.0      # seconds to brake after accelerating
     MAX_CYCLES = 3       # max accel/brake narrowing cycles
     TARGET_CANDIDATES = 50  # stop narrowing when we reach this many
 
@@ -276,14 +276,18 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 
     try:
         for cycle in range(1, MAX_CYCLES + 1):
-            # --- Phase 1: brake to ensure car is stopped ---
-            print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES} — braking for {BRAKE_TIME}s...")
+            # --- Phase 1: brake to slow down, then coast to full stop ---
+            # Square (BTN_WEST) is "Brake/Reverse" — holding it while
+            # stopped makes the car reverse, so we brake briefly then
+            # release everything and wait for the car to coast to speed 0.
+            print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES} — stopping car...")
             gamepad.hold_button(e.BTN_WEST)       # Square = brake
             gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
             time.sleep(BRAKE_TIME)
             gamepad.release_button(e.BTN_WEST)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-            time.sleep(0.5)  # settle
+            print(f"[calibrate] Coasting to zero for {COAST_TIME}s...")
+            time.sleep(COAST_TIME)
 
             # --- Phase 2: snapshot while stopped ---
             print("[calibrate] Snapshotting EE RAM (car stopped)...")
@@ -307,21 +311,23 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             prev_label = "all" if cycle == 1 else "prev"
             print(f"[calibrate] Filter 'increased': {prev_label} → {len(candidates):,} candidates")
 
+            # Release accelerate
+            gamepad.release_button(e.BTN_SOUTH)
+            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+
             if len(candidates) <= TARGET_CANDIDATES:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates — skipping further cycles.")
-                gamepad.release_button(e.BTN_SOUTH)
-                gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
                 break
 
             # --- Phase 6: stop the car again ---
-            print(f"[calibrate] Braking for {STOP_TIME}s...")
-            gamepad.release_button(e.BTN_SOUTH)
+            print(f"[calibrate] Braking for {BRAKE_TIME}s...")
             gamepad.hold_button(e.BTN_WEST)
             gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
-            time.sleep(STOP_TIME)
+            time.sleep(BRAKE_TIME)
             gamepad.release_button(e.BTN_WEST)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-            time.sleep(0.5)
+            print(f"[calibrate] Coasting to zero for {COAST_TIME}s...")
+            time.sleep(COAST_TIME)
 
             # --- Phase 7: snapshot while stopped again ---
             print("[calibrate] Snapshotting EE RAM (car stopped again)...")
