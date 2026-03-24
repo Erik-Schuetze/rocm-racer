@@ -22,6 +22,7 @@ MEMCARDS_DIR = REPO_ROOT / "memcards"
 SAVESTATES_DIR = REPO_ROOT / "savestates"
 PCSX2_BIN = Path("/usr/bin/pcsx2-qt")
 PCSX2_CONFIG_DIR = Path.home() / ".config" / "PCSX2"
+PCSX2_INI = PCSX2_CONFIG_DIR / "inis" / "PCSX2.ini"
 CONTROLLER_DB_PATH = PCSX2_CONFIG_DIR / "game_controller_db.txt"
 ISO_MAP = {
     "nfsu2": ISO_DIR / "Need for Speed - Underground 2 (USA, Canada).iso",
@@ -57,7 +58,26 @@ def write_controller_db() -> None:
 # PCSX2 process management
 # ---------------------------------------------------------------------------
 
-def launch_pcsx2(iso: Path, statefile: Path | None = None) -> subprocess.Popen:
+def set_pcsx2_speed_scalar(scalar: int) -> None:
+    """
+    Patch NominalScalar in PCSX2.ini so PCSX2 runs at N× speed.
+    scalar=1 → normal, scalar=2 → double (turbo), etc.
+    The value is written before launching PCSX2; PCSX2 reads it on startup.
+    """
+    import re
+    text = PCSX2_INI.read_text()
+    text = re.sub(
+        r"(NominalScalar\s*=\s*)\S+",
+        lambda m: f"{m.group(1)}{scalar}",
+        text,
+    )
+    PCSX2_INI.write_text(text)
+
+
+def launch_pcsx2(iso: Path, statefile: Path | None = None, speed_scalar: int = 1) -> subprocess.Popen:
+    if speed_scalar != 1:
+        set_pcsx2_speed_scalar(speed_scalar)
+        print(f"[rocm-racer] Emulation speed: {speed_scalar}× (NominalScalar={speed_scalar})")
     cmd = [
         str(PCSX2_BIN),
         "-nogui",
@@ -171,6 +191,8 @@ def parse_args() -> argparse.Namespace:
                         help="PyTorch device for training (default: cuda)")
     parser.add_argument("--no-preview", action="store_true",
                         help="Disable the live OpenCV preview window during training")
+    parser.add_argument("--turbo", action="store_true",
+                        help="Run PCSX2 at 2× speed to accelerate training")
     return parser.parse_args()
 
 
@@ -1052,12 +1074,13 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     from memory_readers.virtual_gamepad import VirtualGamepad
 
     pcsx2_proc: subprocess.Popen | None = None
+    speed_scalar = 2 if args.turbo else 1
 
     write_controller_db()
     gamepad = VirtualGamepad()
     gamepad.open()
 
-    pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
+    pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile, speed_scalar=speed_scalar)
     wait_for_pcsx2_ready()
 
     # Connect PINE and verify calibration
@@ -1155,6 +1178,9 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         env.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
+        if speed_scalar != 1:
+            set_pcsx2_speed_scalar(1)
+            print("[train] Restored PCSX2 speed to 1×")
 
 
 # ---------------------------------------------------------------------------
