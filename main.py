@@ -284,27 +284,21 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
         time.sleep(COAST_TIME)
 
     try:
+        # Car is already stopped from savestate — take initial stopped snapshot
+        print("\n[calibrate] Snapshot (stopped — from savestate)...")
+        snap_stopped = reader.snapshot_ee_ram()
+        time.sleep(1.0)
+        snap_stopped_2 = reader.snapshot_ee_ram()
+
+        results = NFSU2MemoryReader.diff_scan(
+            snap_stopped, snap_stopped_2, "unchanged", candidates
+        )
+        prev_count = len(candidates) if candidates else "all"
+        candidates = [addr for addr, _, _ in results]
+        print(f"[calibrate] Filter 'unchanged@stop': {prev_count} → {len(candidates):,}")
+
         for cycle in range(1, MAX_CYCLES + 1):
-            # --- Stop the car ---
-            print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES} — stopping car...")
-            _stop_car()
-
-            # --- Snapshot while stopped ---
-            print("[calibrate] Snapshot (stopped)...")
-            snap_stopped = reader.snapshot_ee_ram()
-
-            # --- "Unchanged while stopped" filter: take a second stopped
-            # snapshot after a short wait to eliminate timers/counters that
-            # keep changing even when the car is stationary. ---
-            time.sleep(1.0)
-            print("[calibrate] Snapshot (still stopped)...")
-            snap_stopped_2 = reader.snapshot_ee_ram()
-            results = NFSU2MemoryReader.diff_scan(
-                snap_stopped, snap_stopped_2, "unchanged", candidates
-            )
-            prev_count = len(candidates) if candidates else "all"
-            candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'unchanged@stop': {prev_count} → {len(candidates):,}")
+            print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES}")
 
             if len(candidates) <= TARGET_CANDIDATES:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
@@ -334,23 +328,17 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
                 break
 
-            # --- Stop again and filter decreased ---
-            # Snapshot promptly after stopping so the two snapshots
-            # (moving vs stopped) are close in time, reducing noise
-            # from unrelated game-state changes.
+            # --- Stop the car ---
             print("[calibrate] Stopping car...")
             _stop_car()
 
-            print("[calibrate] Snapshot (stopped again)...")
-            snap_stopped_3 = reader.snapshot_ee_ram()
-
-            # Also grab a second stopped snapshot for an extra
-            # "unchanged@stop" pass to further cull noisy addresses.
+            print("[calibrate] Snapshot (stopped)...")
+            snap_stopped = reader.snapshot_ee_ram()
             time.sleep(1.0)
-            snap_stopped_3b = reader.snapshot_ee_ram()
+            snap_stopped_2 = reader.snapshot_ee_ram()
 
             results = NFSU2MemoryReader.diff_scan(
-                snap_moving, snap_stopped_3, "decreased", candidates
+                snap_moving, snap_stopped, "decreased", candidates
             )
             candidates = [addr for addr, _, _ in results]
             print(f"[calibrate] Filter 'decreased': → {len(candidates):,}")
@@ -360,14 +348,10 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 break
 
             results = NFSU2MemoryReader.diff_scan(
-                snap_stopped_3, snap_stopped_3b, "unchanged", candidates
+                snap_stopped, snap_stopped_2, "unchanged", candidates
             )
             candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'unchanged@stop2': → {len(candidates):,}")
-
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
-                break
+            print(f"[calibrate] Filter 'unchanged@stop': → {len(candidates):,}")
 
         # --- Release all input ---
         try:
