@@ -64,29 +64,29 @@ class ThreadedVecEnv(VecEnv):
         self._actions = None
 
         def _step_one(idx: int):
-            return self.envs[idx].step(actions[idx])
+            obs, reward, terminated, truncated, info = self.envs[idx].step(actions[idx])
+            done = terminated or truncated
+            reset_obs = None
+            if done:
+                info["terminal_observation"] = obs
+                reset_obs, _ = self.envs[idx].reset()
+            return obs, reward, terminated, truncated, info, done, reset_obs
 
         futures = [self._executor.submit(_step_one, i) for i in range(self.num_envs)]
         results = [f.result() for f in futures]
 
-        obs_list, rewards, terminateds, truncateds, infos = zip(*results)
+        obs_list = []
+        info_list = []
+        rewards = np.empty(self.num_envs, dtype=np.float64)
+        dones = np.empty(self.num_envs, dtype=bool)
 
-        obs = self._stack_obs(list(obs_list))
-        rews = np.array(rewards, dtype=np.float64)
-        dones = np.array(
-            [t or tr for t, tr in zip(terminateds, truncateds)], dtype=bool
-        )
+        for i, (obs, reward, term, trunc, info, done, reset_obs) in enumerate(results):
+            obs_list.append(reset_obs if done else obs)
+            rewards[i] = reward
+            dones[i] = done
+            info_list.append(info)
 
-        # SB3 expects info dicts with "terminal_observation" on done
-        info_list = list(infos)
-        for i, done in enumerate(dones):
-            if done:
-                info_list[i]["terminal_observation"] = obs_list[i]
-                # Auto-reset
-                new_obs, reset_info = self.envs[i].reset()
-                self._set_obs(obs, i, new_obs)
-
-        return obs, rews, dones, info_list
+        return self._stack_obs(obs_list), rewards, dones, info_list
 
     def close(self) -> None:
         for env in self.envs:
@@ -133,11 +133,3 @@ class ThreadedVecEnv(VecEnv):
                 for key in sample
             }
         return np.stack(obs_list, axis=0)
-
-    def _set_obs(self, obs: VecEnvObs, idx: int, new_obs) -> None:
-        """Replace observation at index *idx* after auto-reset."""
-        if isinstance(obs, dict):
-            for key in obs:
-                obs[key][idx] = new_obs[key]
-        else:
-            obs[idx] = new_obs
