@@ -17,6 +17,8 @@ from memory_readers.virtual_gamepad import VirtualGamepad
 @dataclass(frozen=True)
 class RewardConfig:
     speed_weight: float = 0.02       # per-step: reward = speed_kph * speed_weight (uncapped)
+    stuck_penalty: float = -10.0     # one-time penalty on stuck termination
+    slow_timeout_penalty: float = -5.0  # one-time penalty on slow_timeout termination
     success_bonus: float = 50.0      # applied when distance > success_distance_m
 
 
@@ -172,6 +174,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         if self._stuck_elapsed >= self.config.stuck_timeout_s:
             terminated = True
             terminated_reason = "stuck"
+            reward_terms["stuck"] = self.config.reward.stuck_penalty
 
         # Slow-speed timeout (only after grace period for initial acceleration)
         if not terminated and episode_time > self.config.slow_speed_grace_s:
@@ -182,6 +185,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             if self._slow_speed_elapsed >= self.config.slow_speed_timeout_s:
                 terminated = True
                 terminated_reason = "slow_timeout"
+                reward_terms["slow_timeout"] = self.config.reward.slow_timeout_penalty
 
         # Success
         if not terminated and distance >= self.config.success_distance_m:
