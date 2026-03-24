@@ -33,6 +33,7 @@ class PCSX2EnvConfig:
     # Termination thresholds
     slow_speed_threshold_kph: float = 30.0
     slow_speed_timeout_s: float = 3.0
+    slow_speed_grace_s: float = 5.0  # ignore slow speed for first N seconds (acceleration time)
     success_distance_m: float = 1000.0
     # Crash detection: speed drop within this window triggers crash penalty
     crash_decel_window_s: float = 1.0
@@ -179,6 +180,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         # --- Termination conditions ---
         terminated = False
         terminated_reason = ""
+        episode_time = self._episode_steps * self.config.step_interval_seconds
 
         if crash:
             terminated = True
@@ -187,8 +189,8 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             terminated = True
             terminated_reason = "success"
             reward_terms["success"] = self.config.reward.success_bonus
-        else:
-            # Slow-speed timeout
+        elif episode_time > self.config.slow_speed_grace_s:
+            # Slow-speed timeout (only after grace period for initial acceleration)
             if telemetry.speed_kph < self.config.slow_speed_threshold_kph:
                 self._slow_speed_elapsed += self.config.step_interval_seconds
             else:

@@ -23,6 +23,8 @@ from typing import Any
 # On Wayland sessions QT_QPA_PLATFORM is typically set to "wayland",
 # which crashes cv2. Force xcb before cv2 is imported.
 os.environ["QT_QPA_PLATFORM"] = "xcb"
+# Suppress "Cannot find font directory" spam from Qt (harmless, fonts are unused)
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 
 import cv2
 import numpy as np
