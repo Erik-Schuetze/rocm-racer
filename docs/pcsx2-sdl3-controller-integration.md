@@ -278,3 +278,66 @@ kbd.press("k", duration=0.1)   # K = Cross (✕) = accelerate in NFSU2
 | `j` | Square □  | Handbrake    |
 | `i` | Triangle △| Nitrous      |
 | `a` / `d` | Left stick | Steer |
+
+## PINE IPC: reading PS2 memory without ptrace
+
+PCSX2 has a built-in IPC server called **PINE** (PCSX2 IPC Network Extension) that provides direct read/write access to PS2 EE memory over a Unix domain socket. This bypasses all ptrace, `/proc/pid/mem`, and kernel permission issues.
+
+### Why PINE is needed
+
+On Arch Linux, the `pcsx2-qt` binary has filesystem capabilities (`cap_net_admin,cap_net_raw=eip`). The kernel automatically sets `PR_SET_DUMPABLE=0` for cap-elevated binaries, which makes `/proc/pid/mem` owned by `root:root` and inaccessible to the same user — even with `ptrace_scope=0`. Neither `PTRACE_SEIZE` nor `suid_dumpable=1` reliably fixes this at runtime.
+
+PINE communicates over a Unix domain socket and reads EE memory from within the PCSX2 process itself, so no external memory access is needed.
+
+### Enabling PINE
+
+In `~/.config/PCSX2/inis/PCSX2.ini`:
+
+```ini
+EnablePINE = true
+PINESlot = 28011
+```
+
+Or in the PCSX2 GUI: **Settings → Advanced → Enable PINE IPC**.
+
+**PCSX2 must be restarted** after enabling PINE. The socket is created during PCSX2 startup at:
+
+```
+$XDG_RUNTIME_DIR/pcsx2.sock     (typically /run/user/1000/pcsx2.sock)
+```
+
+If `XDG_RUNTIME_DIR` is unset, it falls back to `/tmp/pcsx2.sock`.
+
+### How the memory reader uses PINE
+
+`memory_readers/nfsu2_memory.py` tries PINE first, then falls back to `/proc/pid/mem`:
+
+1. Attempt to connect to the PINE Unix socket
+2. If connected: all memory reads go through PINE (no PID detection, no EE base resolution needed — PINE uses PS2 addresses directly)
+3. If PINE is unavailable: fall back to resolving EE base from emulog + reading `/proc/pid/mem` (requires appropriate kernel settings)
+
+### PINE protocol (for reference)
+
+The protocol is a simple binary format over the Unix socket:
+
+| Direction | Format |
+|-----------|--------|
+| Request   | `[total_size u32 LE][opcode u8][params...]` (can batch multiple commands) |
+| Response  | `[total_size u32 LE][result_code u8 (0=OK, 0xFF=FAIL)][data...]` |
+
+Key opcodes: `Read8=0`, `Read16=1`, `Read32=2`, `Read64=3`, `Write32=6`, `Version=8`, `SaveState=9`, `LoadState=0xA`, `Status=0xF`.
+
+The `memory_readers/pine_client.py` module implements a pure-Python client with support for batched reads (multiple Read32 commands in a single round-trip), which is used for bulk 32MB EE RAM scans during calibration.
+
+### Verifying PINE is working
+
+```bash
+python -c "
+from memory_readers.pine_client import PINEClient
+with PINEClient() as pine:
+    print('Connected to PINE')
+    print(f'Version: {pine.get_version()}')
+    print(f'Status: {pine.get_status()}')  # 0=Running
+    print(f'Title: {pine.get_game_title()}')
+"
+```
