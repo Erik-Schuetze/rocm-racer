@@ -277,8 +277,8 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 "pos_triplet": None,
             }
 
-            # Quaternion search (±0x400)
-            quats = _phase2_quaternion_search(snap_moving, speed_addr)
+            # Quaternion search (±0x400) — needs both snapshots to reject identity quats
+            quats = _phase2_quaternion_search(snap_stopped, snap_moving, speed_addr)
             if quats:
                 result["quat_addr"] = quats[0][0]
                 result["quat_sq"]   = quats[0][1]
@@ -287,7 +287,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             # Velocity + position triplet search (±0x200 around quaternion or speed)
             anchor = result["quat_addr"] if result["quat_addr"] is not None else speed_addr
             offsets_info = _phase3_discover_struct_offsets(
-                snap_stopped, snap_moving, speed_addr, anchor, window=0x200
+                snap_stopped, snap_moving, speed_addr, speed_val, anchor, window=0x200
             )
             if offsets_info["vel_triplets"]:
                 result["vel_triplet"] = offsets_info["vel_triplets"][0]
@@ -437,53 +437,92 @@ def _phase1_find_speed_candidates(
 
 
 def _phase2_quaternion_search(
-    data: bytes,
+    data_stopped: bytes,
+    data_moving: bytes,
     speed_addr: int,
     window: int = 0x400,
 ) -> list[tuple[int, float]]:
     """Phase 2: find normalized quaternion in ±window bytes around speed_addr.
 
-    A quaternion is 4 adjacent Float32s where sum of squares ≈ 1.0.
+    A quaternion is 4 adjacent Float32s where sum of squares ≈ 1.0 in BOTH
+    snapshots.  Rejects identity quaternions (1,0,0,0) that don't change
+    between snapshots — a real vehicle orientation must have some yaw and
+    should shift slightly even on a straight road.
+
     Uses float64 arithmetic to avoid overflow on large garbage values.
-    Returns list of (quat_base_addr, quat_sq) sorted by closeness to 1.0.
+    Returns list of (quat_base_addr, quat_sq) sorted by quality score.
     """
+    import math
     from memory_readers.nfsu2_memory import _EE_RAM_SIZE
 
     start = max(0, speed_addr - window) & ~3
     end   = min(_EE_RAM_SIZE - 16, speed_addr + window)
 
-    f32     = np.frombuffer(data, dtype=np.float32)
+    f32_s = np.frombuffer(data_stopped, dtype=np.float32)
+    f32_m = np.frombuffer(data_moving, dtype=np.float32)
     results: list[tuple[int, float]] = []
 
     for byte_off in range(start, end - 12, 4):
         idx = byte_off // 4
-        if idx + 3 >= len(f32):
+        if idx + 3 >= len(f32_s) or idx + 3 >= len(f32_m):
             break
-        vals = f32[idx:idx + 4]
-        if not np.all(np.isfinite(vals)):
-            continue
-        # Use float64 to prevent overflow on large values
-        vals64 = vals.astype(np.float64)
-        sq = float(np.sum(vals64 * vals64))
-        if 0.98 < sq < 1.02:
-            results.append((byte_off, sq))
 
-    results.sort(key=lambda x: abs(x[1] - 1.0))
-    return results
+        vals_s = f32_s[idx:idx + 4].astype(np.float64)
+        vals_m = f32_m[idx:idx + 4].astype(np.float64)
+
+        if not (np.all(np.isfinite(vals_s)) and np.all(np.isfinite(vals_m))):
+            continue
+
+        sq_s = float(np.sum(vals_s * vals_s))
+        sq_m = float(np.sum(vals_m * vals_m))
+
+        # Must be normalized in BOTH snapshots
+        if not (0.98 < sq_s < 1.02 and 0.98 < sq_m < 1.02):
+            continue
+
+        # Reject identity quaternion (1,0,0,0) or (0,0,0,1) that stays constant
+        # — a real orientation must have non-trivial components
+        is_identity_s = (abs(abs(vals_s[0]) - 1.0) < 0.01 and
+                         abs(vals_s[1]) < 0.01 and abs(vals_s[2]) < 0.01 and
+                         abs(vals_s[3]) < 0.01)
+        is_identity_s |= (abs(vals_s[0]) < 0.01 and abs(vals_s[1]) < 0.01 and
+                          abs(vals_s[2]) < 0.01 and abs(abs(vals_s[3]) - 1.0) < 0.01)
+        is_identity_m = (abs(abs(vals_m[0]) - 1.0) < 0.01 and
+                         abs(vals_m[1]) < 0.01 and abs(vals_m[2]) < 0.01 and
+                         abs(vals_m[3]) < 0.01)
+        is_identity_m |= (abs(vals_m[0]) < 0.01 and abs(vals_m[1]) < 0.01 and
+                          abs(vals_m[2]) < 0.01 and abs(abs(vals_m[3]) - 1.0) < 0.01)
+        if is_identity_s and is_identity_m:
+            continue
+
+        # Prefer quaternions that changed between snapshots (car rotated)
+        delta = float(np.sum((vals_m - vals_s) ** 2))
+        # Score: closer to 1.0 norm is better, bonus for changing between snapshots
+        quality = abs(sq_m - 1.0) + abs(sq_s - 1.0) - min(delta, 0.1) * 5
+        results.append((byte_off, sq_m, quality))
+
+    # Sort by quality (lower is better)
+    results.sort(key=lambda x: x[2])
+    # Return in (addr, sq) format
+    return [(addr, sq) for addr, sq, _ in results]
 
 
 def _phase3_discover_struct_offsets(
     data_stopped: bytes,
     data_moving: bytes,
     speed_addr: int,
+    speed_val: float,
     quat_addr: int,
     window: int = 0x100,
 ) -> dict:
     """Phase 3: empirically discover position and velocity offsets.
 
     Scans ±window around the quaternion anchor for:
-    - Velocity: 3 floats near-zero when stopped, non-zero while moving
-    - Position: 3 floats with world-scale values (1-100000), stable but changed
+    - Velocity: 3 consecutive floats near-zero when stopped, with magnitude
+      roughly matching speed_val when moving (within 2x tolerance)
+    - Position: 3 consecutive floats with world-scale values (1-100000) in
+      both snapshots, where the horizontal distance changed (car moved)
+      but the values didn't teleport (< 1000m change in 3 seconds)
 
     Returns dict with vel_triplets, pos_triplets, and raw candidate lists.
     """
@@ -507,10 +546,14 @@ def _phase3_discover_struct_offsets(
         vm = float(f32_m[idx])
         if not (math.isfinite(vs) and math.isfinite(vm)):
             continue
+        # Velocity: near 0 stopped, meaningful while moving
         if abs(vs) < 0.1 and abs(vm) > 0.5:
             vel_candidates.append((byte_off, vs, vm))
+        # Position: world-scale, both finite, changed but not teleported
         if 1.0 < abs(vs) < 100_000 and 1.0 < abs(vm) < 100_000:
-            pos_candidates.append((byte_off, vs, vm))
+            delta = abs(vm - vs)
+            if delta < 1000:  # < 1km change in 3s of driving is realistic
+                pos_candidates.append((byte_off, vs, vm))
 
     def _triplets(addrs: list[int]) -> list[tuple[int, int, int]]:
         out = []
@@ -520,9 +563,47 @@ def _phase3_discover_struct_offsets(
                 out.append((a, b, c))
         return out
 
+    # Filter velocity triplets: magnitude should be within 0.3x–3x of speed
+    vel_triplets_raw = _triplets(sorted(a for a, _, _ in vel_candidates))
+    vel_lookup = {a: (vs, vm) for a, vs, vm in vel_candidates}
+    vel_triplets_scored: list[tuple[tuple[int, int, int], float]] = []
+
+    for tri in vel_triplets_raw:
+        vx = vel_lookup.get(tri[0], (0, 0))[1]
+        vy = vel_lookup.get(tri[1], (0, 0))[1]
+        vz = vel_lookup.get(tri[2], (0, 0))[1]
+        mag = math.sqrt(vx*vx + vy*vy + vz*vz)
+        if speed_val > 0:
+            ratio = mag / speed_val
+            if 0.3 < ratio < 3.0:
+                vel_triplets_scored.append((tri, abs(ratio - 1.0)))
+
+    vel_triplets_scored.sort(key=lambda x: x[1])
+    vel_triplets = [t for t, _ in vel_triplets_scored]
+
+    # Filter position triplets: at least 2 of 3 components should have changed
+    pos_triplets_raw = _triplets(sorted(a for a, _, _ in pos_candidates))
+    pos_lookup = {a: (vs, vm) for a, vs, vm in pos_candidates}
+    pos_triplets_scored: list[tuple[tuple[int, int, int], float]] = []
+
+    for tri in pos_triplets_raw:
+        deltas = []
+        for addr in tri:
+            vs, vm = pos_lookup.get(addr, (0, 0))
+            deltas.append(abs(vm - vs))
+        changed = sum(1 for d in deltas if d > 0.5)
+        if changed >= 2:
+            total_dist = math.sqrt(sum(d*d for d in deltas))
+            # Prefer moderate movement (1–200m in 3s is realistic)
+            if 1.0 < total_dist < 500:
+                pos_triplets_scored.append((tri, abs(total_dist - 50)))
+
+    pos_triplets_scored.sort(key=lambda x: x[1])
+    pos_triplets = [t for t, _ in pos_triplets_scored]
+
     return {
-        "vel_triplets": _triplets(sorted(a for a, _, _ in vel_candidates)),
-        "pos_triplets": _triplets(sorted(a for a, _, _ in pos_candidates)),
+        "vel_triplets": vel_triplets,
+        "pos_triplets": pos_triplets,
         "vel_candidates": vel_candidates[:20],
         "pos_candidates": pos_candidates[:20],
     }
