@@ -58,6 +58,21 @@ def write_controller_db() -> None:
 # ---------------------------------------------------------------------------
 
 
+def set_pcsx2_speed_scalar(scalar: float = 1.0, ini_path: Path | None = None) -> None:
+    """Patch NominalScalar under [Framerate] in PCSX2.ini."""
+    ini = ini_path or (PCSX2_CONFIG_DIR / "inis" / "PCSX2.ini")
+    if not ini.exists():
+        return
+    text = ini.read_text()
+    import re
+    text = re.sub(
+        r"(?m)^(NominalScalar\s*=\s*)[\d.]+",
+        rf"\g<1>{scalar}",
+        text,
+    )
+    ini.write_text(text)
+
+
 def launch_pcsx2(
     iso: Path,
     statefile: Path | None = None,
@@ -73,17 +88,23 @@ def launch_pcsx2(
     statefile : Path, optional
         Savestate to load on startup.
     turbo : bool
-        Pass ``-turbo`` to PCSX2 for fast-forward emulation.
+        Set NominalScalar=2 in PCSX2.ini for 2× emulation speed.
     env_override : dict, optional
         Extra environment variables (used for multi-instance isolation).
     """
+    # Determine which INI to patch (per-instance or global)
+    ini_path = None
+    if env_override and "XDG_CONFIG_HOME" in env_override:
+        ini_path = Path(env_override["XDG_CONFIG_HOME"]) / "PCSX2" / "inis" / "PCSX2.ini"
+
+    if turbo:
+        set_pcsx2_speed_scalar(2.0, ini_path=ini_path)
+
     cmd = [
         str(PCSX2_BIN),
         "-nogui",
         "-batch",
     ]
-    if turbo:
-        cmd.append("-turbo")
     if statefile is not None:
         if not statefile.exists():
             print(
@@ -1278,6 +1299,8 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         model.save(final_path)
         print(f"[train] Final model saved → {final_path}.zip")
         vec_env.close()
+        if args.turbo:
+            set_pcsx2_speed_scalar(1.0)
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
         if instance_mgr is not None:

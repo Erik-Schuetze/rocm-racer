@@ -142,9 +142,20 @@ class InstanceManager:
 
     def launch_instance(self, cfg: InstanceConfig, turbo: bool = False) -> None:
         """Launch one PCSX2 process with isolated env vars."""
-        cmd = [str(PCSX2_BIN), "-nogui", "-batch"]
+        # Patch speed scalar in per-instance INI if turbo requested
         if turbo:
-            cmd.append("-turbo")
+            ini_path = Path(cfg.config_dir) / "PCSX2" / "inis" / "PCSX2.ini"
+            if ini_path.exists():
+                import re
+                text = ini_path.read_text()
+                text = re.sub(
+                    r"(?m)^(NominalScalar\s*=\s*)[\d.]+",
+                    r"\g<1>2",
+                    text,
+                )
+                ini_path.write_text(text)
+
+        cmd = [str(PCSX2_BIN), "-nogui", "-batch"]
         if self.statefile is not None:
             cmd += ["-statefile", str(self.statefile)]
         cmd += ["--", str(self.iso)]
