@@ -221,7 +221,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     ACCEL_TIME = 3.0
-    STEER_TIME = 0.2   # gentle left nudge for 3rd snapshot
+    STEER_TIME = 0.4   # gentle left nudge for 3rd snapshot
 
     print("[rocm-racer] ══════════════════════════════════════════════════════════")
     print("[rocm-racer]  Calibration — differential scan + 3-snapshot verification")
@@ -471,9 +471,12 @@ def _phase2_quaternion_search(
     """Phase 2: find normalized quaternion in ±window bytes around speed_addr.
 
     A quaternion is 4 adjacent Float32s where sum of squares ≈ 1.0 in BOTH
-    snapshots.  Rejects identity quaternions (1,0,0,0) that don't change
-    between snapshots — a real vehicle orientation must have some yaw and
-    should shift slightly even on a straight road.
+    snapshots.  Additional filters:
+    - Rejects identity quaternions (1,0,0,0)
+    - Rejects degenerate 2D unit vectors where 2+ components are always ~0
+      (these are typically wheel spin angles, not car body orientation)
+    - A proper 3D orientation quaternion must have at least 3 non-zero
+      components (e.g. yaw-only: (0, sin(θ/2), 0, cos(θ/2)) has 2 non-zero)
 
     Uses float64 arithmetic to avoid overflow on large garbage values.
     Returns list of (quat_base_addr, quat_sq) sorted by quality score.
@@ -507,7 +510,6 @@ def _phase2_quaternion_search(
             continue
 
         # Reject identity quaternion (1,0,0,0) or (0,0,0,1) that stays constant
-        # — a real orientation must have non-trivial components
         is_identity_s = (abs(abs(vals_s[0]) - 1.0) < 0.01 and
                          abs(vals_s[1]) < 0.01 and abs(vals_s[2]) < 0.01 and
                          abs(vals_s[3]) < 0.01)
@@ -521,10 +523,26 @@ def _phase2_quaternion_search(
         if is_identity_s and is_identity_m:
             continue
 
+        # Reject degenerate "2D unit vectors" — if 2+ components are ~0 in
+        # BOTH snapshots, this is not a proper 3D orientation quaternion.
+        # Real car heading quats have at least 2 non-trivial components
+        # (e.g. yaw-only: (0, sin(θ/2), 0, cos(θ/2))).
+        # Wheel spin angles often appear as (cos(θ), 0, sin(θ), 0).
+        near_zero_s = sum(1 for v in vals_s if abs(v) < 0.01)
+        near_zero_m = sum(1 for v in vals_m if abs(v) < 0.01)
+        if near_zero_s >= 2 and near_zero_m >= 2:
+            # Check if the SAME components are zero — degenerate 2D rotation
+            zero_mask_s = [abs(v) < 0.01 for v in vals_s]
+            zero_mask_m = [abs(v) < 0.01 for v in vals_m]
+            if zero_mask_s == zero_mask_m:
+                continue
+
         # Prefer quaternions that changed between snapshots (car rotated)
+        # but not TOO much — driving straight should cause small heading drift,
+        # not wild oscillation (which indicates wheel spin or other periodic values)
         delta = float(np.sum((vals_m - vals_s) ** 2))
-        # Score: closer to 1.0 norm is better, bonus for changing between snapshots
-        quality = abs(sq_m - 1.0) + abs(sq_s - 1.0) - min(delta, 0.1) * 5
+        # Score: closer to 1.0 norm is better, small change preferred over huge change
+        quality = abs(sq_m - 1.0) + abs(sq_s - 1.0) - min(delta, 0.05) * 5
         results.append((byte_off, sq_m, quality))
 
     # Sort by quality (lower is better)
