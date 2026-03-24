@@ -275,11 +275,9 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     candidates: list[int] | None = None
 
     def _stop_car() -> None:
-        """Brake briefly then coast to a full stop."""
-        gamepad.hold_button(e.BTN_WEST)
+        """Brake via analog stick then coast to a full stop."""
         gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
         time.sleep(BRAKE_TIME)
-        gamepad.release_button(e.BTN_WEST)
         gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
         time.sleep(COAST_TIME)
 
@@ -306,17 +304,15 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 
             # --- Accelerate ---
             print(f"[calibrate] Accelerating for {ACCEL_TIME}s...")
-            gamepad.hold_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(ACCEL_TIME)
 
-            # --- Snapshot while moving (button still held) ---
+            # --- Snapshot while moving (throttle still held) ---
             print("[calibrate] Snapshot (moving)...")
             snap_moving = reader.snapshot_ee_ram()
             time.sleep(1.0)
             snap_moving_2 = reader.snapshot_ee_ram()
 
-            gamepad.release_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
             # --- Filter: increased (stopped → moving) ---
@@ -368,11 +364,6 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             print(f"[calibrate] Filter 'unchanged@stop': → {len(candidates):,}")
 
         # --- Release all input ---
-        try:
-            gamepad.release_button(e.BTN_SOUTH)
-            gamepad.release_button(e.BTN_WEST)
-        except Exception:
-            pass
         gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
         if not candidates:
@@ -461,7 +452,6 @@ def _score_candidates(
 
     # --- Accelerate for 2s then read again ---
     print("[calibrate] Verification: accelerating for 2s...")
-    gamepad.hold_button(e.BTN_SOUTH)
     gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
     time.sleep(2.0)
 
@@ -481,7 +471,6 @@ def _score_candidates(
         except (RuntimeError, OSError):
             continue
 
-    gamepad.release_button(e.BTN_SOUTH)
     gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
     # --- Score each candidate ---
