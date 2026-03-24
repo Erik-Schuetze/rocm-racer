@@ -55,13 +55,15 @@ class TelemetryOffsets:
 
 @dataclass(frozen=True)
 class TelemetrySample:
-    """One frame of vehicle telemetry."""
+    """One frame of vehicle telemetry.
 
-    position: tuple[float, float, float]   # X, Y, Z  (meters)
-    velocity: tuple[float, float, float]   # X, Y, Z  (m/s)
-    speed_ms: float                        # absolute scalar speed (m/s or engine units)
-    speed_kph: float                       # speed_ms × 3.6 (approximate if unit unknown)
-    rotation: tuple[float, float, float, float]  # QuatRot x, y, z, w
+    Only speed and position are confirmed reliable for SLUS-21065 (PS2 NTSC-U).
+    See docs/underground-2-telemetry-memory-map.md for full findings.
+    """
+
+    position: tuple[float, float, float]   # X, Y, Z  (world units, ~1 unit ≈ 1 m)
+    speed_ms: float                        # scalar speed (m/s, confirmed vs speedometer)
+    speed_kph: float                       # speed_ms × 3.6
 
     # --- env-compat stubs (need separate calibration) ---
     track_progress: float = 0.0
@@ -69,16 +71,13 @@ class TelemetrySample:
     wall_collision_flag: bool = False
 
     def as_observation(self) -> np.ndarray:
-        """8-D telemetry vector consumed by PCSX2RacerEnv."""
+        """5-D telemetry vector consumed by PCSX2RacerEnv."""
         return np.asarray(
             [
                 self.speed_kph,
                 self.position[0],
                 self.position[1],
                 self.position[2],
-                self.rotation[0],
-                self.rotation[1],
-                self.rotation[2],
                 self.track_progress,
             ],
             dtype=np.float32,
@@ -88,10 +87,7 @@ class TelemetrySample:
         """Human-readable one-liner for dashboard logging."""
         return (
             f"Speed: {self.speed_kph:6.1f} km/h  "
-            f"Pos: ({self.position[0]:9.2f}, {self.position[1]:7.2f}, {self.position[2]:9.2f})  "
-            f"Vel: ({self.velocity[0]:7.2f}, {self.velocity[1]:7.2f}, {self.velocity[2]:7.2f})  "
-            f"Rot: ({self.rotation[0]:6.3f}, {self.rotation[1]:6.3f}, "
-            f"{self.rotation[2]:6.3f}, {self.rotation[3]:6.3f})"
+            f"Pos: ({self.position[0]:9.2f}, {self.position[1]:7.2f}, {self.position[2]:9.2f})"
         )
 
 
@@ -260,33 +256,10 @@ class NFSU2MemoryReader:
         else:
             position = (0.0, 0.0, 0.0)
 
-        # Read velocity (fallback to 0.0 if uncalibrated)
-        if any(a != 0 for a in self._vel_addrs):
-            velocity = (
-                self._read_f32(self._vel_addrs[0]),
-                self._read_f32(self._vel_addrs[1]),
-                self._read_f32(self._vel_addrs[2]),
-            )
-        else:
-            velocity = (0.0, 0.0, 0.0)
-
-        # Read rotation quaternion (fallback to identity if uncalibrated)
-        if any(a != 0 for a in self._rot_addrs):
-            rotation = (
-                self._read_f32(self._rot_addrs[0]),
-                self._read_f32(self._rot_addrs[1]),
-                self._read_f32(self._rot_addrs[2]),
-                self._read_f32(self._rot_addrs[3]),
-            )
-        else:
-            rotation = (0.0, 0.0, 0.0, 1.0)
-
         return TelemetrySample(
             position=position,
-            velocity=velocity,
             speed_ms=speed_ms,
             speed_kph=speed_kph,
-            rotation=rotation,
         )
 
     # ----- scan helpers -----

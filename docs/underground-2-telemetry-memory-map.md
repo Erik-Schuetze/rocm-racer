@@ -1,42 +1,65 @@
-# Need for Speed: Underground 2 - Telemetry Memory Map
+# Need for Speed: Underground 2 — Telemetry Memory Map (SLUS-21065, PS2 NTSC-U)
 
-> **⚠️ DEPRECATED** — This document contains **estimated** offsets that have been
-> superseded by the verified research in
-> [`ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md`](ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md).
-> Use the new document as the authoritative reference. The corrected offsets are
-> now in the codebase (`TelemetryOffsets` in `memory_readers/nfsu2_memory.py`).
+> **Status:** Partially calibrated. Speed and position are empirically verified.
+> Velocity and rotation addresses have been found but are not reliable enough for
+> use — see the findings section below.
 
-### Technical Deep-Dive
+## Verified Fields (in active use)
 
-**PCSX2 Emotion Engine Memory Architecture**
-The PlayStation 2 utilizes a **32 MB** block of main system RAM managed by the Emotion Engine (EE). When running PCSX2 on Linux, this entire block is mapped into the host system's virtual memory space. To read telemetry, the Python agent must locate the dynamic base address of this EE block within `/proc/[pid]/maps`. All game-specific memory addresses are static hexadecimal offsets relative to this EE base address.
+These are discovered by `python main.py --calibrate` and stored in `saves/calibration.json`.
+Addresses are dynamic (heap-allocated per session) — no static pointer has been found.
 
-**The Vehicle Telemetry Struct**
-Like most RenderWare-engine games, *Underground 2* stores player data in a contiguous C++ struct. Once the base pointer for the player's vehicle object is located in the EE memory, the individual telemetry variables (coordinates, velocity, rotation) are found at static offsets relative to that vehicle pointer. 
+| Field | Format | Address (example) | Verified by |
+|:------|:-------|:-----------------|:------------|
+| **Scalar speed** | Float32, m/s | `0x00750390` | Matches in-game speedometer gauge |
+| **Position X** | Float32, world units | `0x00750380` | Smooth movement across wall-hit, ~1 unit ≈ 1 m |
+| **Position Y** | Float32, world units | `0x00750384` | Monotonically decreasing altitude on downhill road |
+| **Position Z** | Float32, world units | `0x00750388` | Consistent small-magnitude lateral drift |
 
-**Data Types and Conversion**
-* **Coordinates and Vectors**: The game engine uses 32-bit floating-point numbers (`Float32`) for spatial data. The Z-axis represents longitudinal movement, the X-axis represents lateral movement, and the Y-axis represents vertical elevation.
-* **Velocity vs. Absolute Speed**: The physics engine calculates velocity as 3D vectors (**m/s**). A separate derived float stores the absolute scalar speed. The value is stored in meters per second (**m/s**) and must be multiplied by **3.6** to convert to **km/h** for the agent's reward function.
+Position moves ~14 m per 0.5 s reading at 100 km/h (expected: ~14 m). ✅
 
-**Unverified Base Pointer:** The exact static base pointer for the player's vehicle object in the PS2 NTSC-U v1.2 release is **Unverified**. While the internal struct offsets remain identical across platforms, the absolute EE memory address for the base pointer shifts depending on the specific PCSX2 build and Linux memory allocation. You must use a memory scanner on the active PCSX2 process to execute a pointer scan (searching for the known absolute speed float) to verify the primary vehicle pointer for your specific Arch Linux environment.
+## Unresolved Fields
 
-### Telemetry Memory Offsets
+| Field | Problem |
+|:------|:--------|
+| **Velocity (XYZ)** | Address passes calibration filters but explodes to ±30 000 after collision. Likely a physics scratch buffer, not a stable velocity vector. |
+| **Rotation quaternion** | Calibration finds normalized 4-vectors, but they are degenerate `(cos θ, 0, sin θ, 0)` 2D unit vectors (wheel spin angles), not a 3D body-orientation quaternion. Flips sign every frame during straight driving. |
 
-The telemetry data is structured at the following offsets relative to the vehicle base pointer:
+## Why PC Offsets Don't Apply
 
-| Telemetry Data | Data Type | Relative Offset (Hex) | Description / Notes |
-| :--- | :--- | :--- | :--- |
-| **Position X** | `Float32` | `+0x00` | Lateral world coordinate (**meters**). |
-| **Position Y** | `Float32` | `+0x04` | Vertical world coordinate/height (**meters**). |
-| **Position Z** | `Float32` | `+0x08` | Longitudinal world coordinate (**meters**). |
-| **Velocity X** | `Float32` | `+0x10` | Lateral velocity vector. |
-| **Velocity Y** | `Float32` | `+0x14` | Vertical velocity vector (used to detect airborne state). |
-| **Velocity Z** | `Float32` | `+0x18` | Longitudinal velocity vector. |
-| **Absolute Speed** | `Float32` | `+0x24` | Scalar speed in **m/s**. Multiply by **3.6** for **km/h**. |
-| **Rotation Matrix X** | `Float32` | `+0x30` | 3D orientation data (Pitch). |
-| **Rotation Matrix Y** | `Float32` | `+0x34` | 3D orientation data (Yaw/Heading). |
-| **Rotation Matrix Z** | `Float32` | `+0x38` | 3D orientation data (Roll). |
-| **Engine RPM** | `Float32` | `+0x1A4` | Current engine revolutions per minute. |
-| **Current Gear** | `Int32` | `+0x1B0` | Integer representing the active transmission gear. |
+The original assumption was that PS2 NFSU2 used the same RenderWare `VehicleInfo`
+struct layout as the PC build (0x020 pos, 0x070 vel, 0x090 speed). All 29–40
+candidates from the early scanner read exactly `0.000` at those offsets while
+driving at 90 km/h — **proving the PS2 EA Black Box build uses a different struct
+layout, different allocation container, or a console-specific entity header**.
 
-*Note: The exact hexadecimal offsets provided above are **Estimated** based on standard RenderWare vehicle structs utilized in EA Black Box titles. Minor offset shifting may occur depending on the specific memory alignment of the PS2 ISO.*
+Gemini confirmed: no verified static pointer or struct layout exists in public
+`.pnach` databases for SLUS-21065. The correct approach is empirical differential
+scanning (implemented in `--calibrate`).
+
+## Calibration Approach (implemented)
+
+1. **Phase 1a** — Snapshot EE RAM while car is stopped
+2. **Phase 1b** — Accelerate straight 3 s, snapshot (find speed: 0→15–35 m/s)
+3. **Phase 1c** — Gentle 0.4 s left steer + 1 s settle, snapshot (direction changed)
+4. **Phase 2** — Score candidates: quaternion (+3), velocity (+2), position (+2), heap (+1)
+   - Speed candidate must stay in range in the turned snapshot (rejects vel_x aliases)
+   - Quaternion must be normalized in both snapshots, non-identity, non-degenerate 2D
+   - Velocity magnitude must match speed in both moving snapshots (0.7×–1.5×)
+   - Position movement must be smooth across all 3 pairs (no teleportation)
+5. **Phase 3** — Scan static range for pointer to speed address (none found yet)
+
+## EE RAM Layout Reference
+
+- `0x00000000–0x000FFFFF` — kernel / BIOS (filtered out)
+- `0x00100000–0x002FFFFF` — low game data
+- `0x00300000–0x007FFFFF` — heap (vehicle structs live here)
+- `0x00800000–0x01FFFFFF` — upper heap / audio / streaming
+
+## Axis Convention
+
+Based on observed position movement during straight driving on the highway loop:
+
+- **X** — primary travel axis on the highway savestate (increases while driving forward)
+- **Y** — vertical / altitude (decreases slightly on downhill sections)
+- **Z** — lateral / minor axis (small magnitude, changes when turning)
