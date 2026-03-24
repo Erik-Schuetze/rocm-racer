@@ -20,48 +20,48 @@ _EE_RAM_SIZE = 0x0200_0000  # 32 MB PS2 EE physical RAM
 
 @dataclass(frozen=True)
 class TelemetryOffsets:
-    """Vehicle struct offsets from docs/ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md.
+    """Vehicle struct offsets discovered by ``--calibrate`` for NFSU2 on PS2 (SLUS-21065).
 
-    ``static_pointer_addr`` is a PS2-side address in static data (typically
-    0x003X–0x005X) whose 4-byte value points to the dynamic vehicle struct
-    base.  When non-zero, ``resolve_vehicle_base()`` dereferences it on
-    every telemetry read so the address stays valid across savestate reloads.
+    PC RenderWare offsets do NOT map 1:1 to the PS2 build. All offsets here
+    must be discovered empirically via differential scanning + quaternion
+    anchoring and are stored in ``saves/calibration.json``.
 
-    ``vehicle_struct_addr`` is a direct fallback (for manual override or
-    debugging).  A value of 0 for both means *uncalibrated*.
+    ``static_pointer_addr``: PS2 address (0x003X–0x005X) pointing to the
+    dynamic vehicle struct. Auto-dereferenced on every ``read_telemetry()``.
+
+    ``vehicle_struct_addr``: direct fallback / manual override.
+
+    All struct offsets default to 0 (uncalibrated). Run ``--calibrate`` first.
     """
 
     static_pointer_addr: int = 0x0000_0000  # discovered by --calibrate
     vehicle_struct_addr: int = 0x0000_0000  # manual override / debugging
 
-    # Struct member offsets (relative to vehicle struct base).
-    # All vector fields are 16-byte aligned (VPU0 hardware constraint).
-    position_x: int = 0x020        # Float32  lateral (meters)
-    position_y: int = 0x024        # Float32  vertical (meters)
-    position_z: int = 0x028        # Float32  longitudinal (meters)
-    rotation_x: int = 0x030        # Float32  QuatRot matrix — pitch
-    rotation_y: int = 0x034        # Float32  QuatRot matrix — yaw / heading
-    rotation_z: int = 0x038        # Float32  QuatRot matrix — roll
-    velocity_x: int = 0x070        # Float32  lateral m/s
-    velocity_y: int = 0x074        # Float32  vertical m/s
-    velocity_z: int = 0x078        # Float32  longitudinal m/s
-    absolute_speed_ms: int = 0x090 # Float32  scalar speed m/s
-    engine_rpm: int = 0x160        # Float32  (estimated)
-    current_gear: int = 0x164      # Int32    (estimated)
+    # Struct member offsets — discovered empirically, relative to struct base.
+    # Defaults are 0 (uncalibrated). Values are written to calibration.json.
+    absolute_speed_ms: int = 0   # Float32  scalar speed (m/s or engine units)
+    rotation_x: int = 0          # Float32  QuatRot[0]
+    rotation_y: int = 0          # Float32  QuatRot[1]
+    rotation_z: int = 0          # Float32  QuatRot[2]
+    rotation_w: int = 0          # Float32  QuatRot[3]
+    position_x: int = 0          # Float32  lateral (meters)
+    position_y: int = 0          # Float32  vertical (meters)
+    position_z: int = 0          # Float32  longitudinal (meters)
+    velocity_x: int = 0          # Float32  lateral m/s
+    velocity_y: int = 0          # Float32  vertical m/s
+    velocity_z: int = 0          # Float32  longitudinal m/s
+    # speed_unit: stored in calibration.json as string "m/s" or "km/h"
 
 
 @dataclass(frozen=True)
 class TelemetrySample:
     """One frame of vehicle telemetry."""
 
-    # --- documented fields ---
     position: tuple[float, float, float]   # X, Y, Z  (meters)
     velocity: tuple[float, float, float]   # X, Y, Z  (m/s)
-    speed_ms: float                        # absolute scalar speed (m/s)
-    speed_kph: float                       # speed_ms × 3.6
-    rotation: tuple[float, float, float]   # pitch, yaw, roll
-    engine_rpm: float
-    current_gear: int
+    speed_ms: float                        # absolute scalar speed (m/s or engine units)
+    speed_kph: float                       # speed_ms × 3.6 (approximate if unit unknown)
+    rotation: tuple[float, float, float, float]  # QuatRot x, y, z, w
 
     # --- env-compat stubs (need separate calibration) ---
     track_progress: float = 0.0
@@ -90,8 +90,8 @@ class TelemetrySample:
             f"Speed: {self.speed_kph:6.1f} km/h  "
             f"Pos: ({self.position[0]:9.2f}, {self.position[1]:7.2f}, {self.position[2]:9.2f})  "
             f"Vel: ({self.velocity[0]:7.2f}, {self.velocity[1]:7.2f}, {self.velocity[2]:7.2f})  "
-            f"Rot: ({self.rotation[0]:7.3f}, {self.rotation[1]:7.3f}, {self.rotation[2]:7.3f})  "
-            f"RPM: {self.engine_rpm:7.0f}  Gear: {self.current_gear}"
+            f"Rot: ({self.rotation[0]:6.3f}, {self.rotation[1]:6.3f}, "
+            f"{self.rotation[2]:6.3f}, {self.rotation[3]:6.3f})"
         )
 
 
@@ -102,16 +102,44 @@ class NFSU2MemoryReader:
     No ptrace, no ``/proc/pid/mem``, no kernel permission changes.
     Enable PINE in ``~/.config/PCSX2/inis/PCSX2.ini``:
       ``EnablePINE = true``
+
+    Struct offsets are discovered empirically by ``--calibrate`` and loaded
+    from ``saves/calibration.json`` at ``open()`` time.  PC RenderWare offsets
+    do NOT map to the PS2 build and must not be assumed.
     """
+
+    # Default calibration file location (can be overridden)
+    DEFAULT_CALIBRATION_FILE = (
+        __import__("pathlib").Path(__file__).parent.parent / "saves" / "calibration.json"
+    )
 
     def __init__(
         self,
         offsets: TelemetryOffsets | None = None,
         pine_socket: str | None = None,
+        calibration_file: str | None = None,
     ) -> None:
         self.offsets = offsets or TelemetryOffsets()
         self.pine_socket = pine_socket
+        self._cal_file = (
+            __import__("pathlib").Path(calibration_file)
+            if calibration_file
+            else self.DEFAULT_CALIBRATION_FILE
+        )
         self._pine: PINEClient | None = None
+        # Discovered offsets loaded from calibration.json
+        self._speed_offset: int = self.offsets.absolute_speed_ms
+        self._pos_offsets: tuple[int, int, int] = (
+            self.offsets.position_x, self.offsets.position_y, self.offsets.position_z
+        )
+        self._vel_offsets: tuple[int, int, int] = (
+            self.offsets.velocity_x, self.offsets.velocity_y, self.offsets.velocity_z
+        )
+        self._rot_offsets: tuple[int, int, int, int] = (
+            self.offsets.rotation_x, self.offsets.rotation_y,
+            self.offsets.rotation_z, self.offsets.rotation_w
+        )
+        self._speed_unit: str = "unknown"
 
     # ----- lifecycle -----
 
@@ -122,6 +150,54 @@ class NFSU2MemoryReader:
         pine.connect()
         self._pine = pine
         print("[rocm-racer] Connected to PCSX2 via PINE IPC.")
+        self._load_calibration()
+
+    def _load_calibration(self) -> None:
+        """Load discovered offsets from calibration.json if present."""
+        import json
+        if not self._cal_file.exists():
+            return
+        try:
+            with open(self._cal_file) as f:
+                cal = json.load(f)
+
+            def _hex(key: str, default: int = 0) -> int:
+                val = cal.get(key, default)
+                return int(val, 0) if isinstance(val, str) else int(val)
+
+            # Override offsets with calibration values if present
+            if "speed_offset" in cal:
+                self._speed_offset = _hex("speed_offset")
+            if all(k in cal for k in ("pos_x_offset", "pos_y_offset", "pos_z_offset")):
+                self._pos_offsets = (
+                    _hex("pos_x_offset"), _hex("pos_y_offset"), _hex("pos_z_offset")
+                )
+            if all(k in cal for k in ("vel_x_offset", "vel_y_offset", "vel_z_offset")):
+                self._vel_offsets = (
+                    _hex("vel_x_offset"), _hex("vel_y_offset"), _hex("vel_z_offset")
+                )
+            if all(k in cal for k in ("rot_x_offset", "rot_y_offset", "rot_z_offset", "rot_w_offset")):
+                self._rot_offsets = (
+                    _hex("rot_x_offset"), _hex("rot_y_offset"),
+                    _hex("rot_z_offset"), _hex("rot_w_offset")
+                )
+            if "speed_unit" in cal:
+                self._speed_unit = cal["speed_unit"]
+
+            # Also update static/direct address from calibration
+            if "static_pointer_addr" in cal:
+                self.offsets = TelemetryOffsets(
+                    static_pointer_addr=_hex("static_pointer_addr"),
+                    vehicle_struct_addr=_hex("vehicle_struct_addr", 0),
+                )
+            elif "vehicle_struct_addr" in cal:
+                self.offsets = TelemetryOffsets(
+                    vehicle_struct_addr=_hex("vehicle_struct_addr"),
+                )
+
+            print(f"[rocm-racer] Calibration loaded from {self._cal_file}")
+        except Exception as exc:
+            print(f"[rocm-racer] Warning: could not load calibration: {exc}")
 
     def close(self) -> None:
         if self._pine is not None:
@@ -147,42 +223,56 @@ class NFSU2MemoryReader:
         o = self.offsets
         if o.static_pointer_addr != 0:
             raw = self._pine.read_i32(o.static_pointer_addr) & 0xFFFFFFFF
-            # Strip kseg mirror bits to get physical EE address for PINE
             return raw & 0x1FFFFFFF
         elif o.vehicle_struct_addr != 0:
             return o.vehicle_struct_addr
         else:
             raise RuntimeError(
                 "Vehicle struct address is uncalibrated.\n"
-                "Run:  python main.py --calibrate\n"
-                "See docs/ps2-memory-architecture-and-telemetry-extraction-for-nfs-u2.md"
+                "Run:  python main.py --calibrate"
             )
+
+    def is_calibrated(self) -> bool:
+        """Return True if offsets are loaded and struct address is known."""
+        o = self.offsets
+        return (o.static_pointer_addr != 0 or o.vehicle_struct_addr != 0) and self._speed_offset != 0
 
     def read_telemetry(self) -> TelemetrySample:
         self.open()
-        o = self.offsets
+        if not self.is_calibrated():
+            raise RuntimeError(
+                "Vehicle struct address is uncalibrated.\n"
+                "Run:  python main.py --calibrate"
+            )
         base = self.resolve_vehicle_base()
-        speed_ms = self._read_f32(base + o.absolute_speed_ms)
+        speed_raw = self._read_f32(base + self._speed_offset)
+        # If unit is known km/h, convert to m/s; otherwise treat as m/s
+        if self._speed_unit == "km/h":
+            speed_ms = speed_raw / 3.6
+            speed_kph = speed_raw
+        else:
+            speed_ms = speed_raw
+            speed_kph = speed_raw * 3.6
+
         return TelemetrySample(
             position=(
-                self._read_f32(base + o.position_x),
-                self._read_f32(base + o.position_y),
-                self._read_f32(base + o.position_z),
+                self._read_f32(base + self._pos_offsets[0]),
+                self._read_f32(base + self._pos_offsets[1]),
+                self._read_f32(base + self._pos_offsets[2]),
             ),
             velocity=(
-                self._read_f32(base + o.velocity_x),
-                self._read_f32(base + o.velocity_y),
-                self._read_f32(base + o.velocity_z),
+                self._read_f32(base + self._vel_offsets[0]),
+                self._read_f32(base + self._vel_offsets[1]),
+                self._read_f32(base + self._vel_offsets[2]),
             ),
             speed_ms=speed_ms,
-            speed_kph=speed_ms * 3.6,
+            speed_kph=speed_kph,
             rotation=(
-                self._read_f32(base + o.rotation_x),
-                self._read_f32(base + o.rotation_y),
-                self._read_f32(base + o.rotation_z),
+                self._read_f32(base + self._rot_offsets[0]),
+                self._read_f32(base + self._rot_offsets[1]),
+                self._read_f32(base + self._rot_offsets[2]),
+                self._read_f32(base + self._rot_offsets[3]),
             ),
-            engine_rpm=self._read_f32(base + o.engine_rpm),
-            current_gear=self._read_i32(base + o.current_gear),
         )
 
     # ----- scan helpers -----

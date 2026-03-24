@@ -31,6 +31,10 @@ ISO_MAP = {
 # Repo-local save state for the NFSU2 highway loop training anchor.
 DEFAULT_STATEFILE = SAVESTATES_DIR / "rocm-racer-nfsu2-highway.p2s"
 
+# Save state with HUD/gauge enabled — used during calibration so the
+# speedometer is visible for manual verification if needed.
+CALIBRATION_STATEFILE = SAVESTATES_DIR / "rocm-racer-nfsu2-highway-calibration.p2s"
+
 # ---------------------------------------------------------------------------
 # SDL3 controller database
 # ---------------------------------------------------------------------------
@@ -203,124 +207,156 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
-    """Automated vehicle struct discovery via structural fingerprinting.
+    """Automated vehicle struct discovery via differential scanning + quaternion anchoring.
 
-    Uses 16-byte alignment constraints, quaternion validation, and
-    multi-field pattern matching to find the player vehicle struct in
-    the 32 MB EE RAM.  Then discovers a static pointer so the calibration
-    survives across savestate reloads.
+    Phase 1: Differential scan — find Float32 addresses that were ~0.0 when
+             stopped and are now in a speed-like range (15-35 m/s or 75-110 km/h).
+    Phase 2: Quaternion search — for each speed candidate, find a normalized
+             quaternion (4 adj floats, sum-of-squares ≈ 1.0) in ±0x200 window.
+    Phase 3: Offset discovery — empirically find position and velocity fields
+             by scanning around the quaternion anchor.
+    Phase 4: Static pointer scan — find a pointer to the struct in static
+             data range (0x003X–0x005X) for reload-safe calibration.
     """
-    import math
     from memory_readers.nfsu2_memory import NFSU2MemoryReader, TelemetryOffsets
     from memory_readers.virtual_gamepad import VirtualGamepad
     from evdev import ecodes as e
 
-    ACCEL_TIME = 3.0     # seconds to hold accelerate
-    STRUCT_MIN_SIZE = 0x168  # bytes — must cover through gear at 0x164
+    ACCEL_TIME = 3.0
 
-    print("[rocm-racer] ══════════════════════════════════════════════")
-    print("[rocm-racer]  Calibration — structural fingerprint scanner ")
-    print("[rocm-racer] ══════════════════════════════════════════════")
+    print("[rocm-racer] ══════════════════════════════════════════════════════")
+    print("[rocm-racer]  Calibration — differential scan + quaternion anchoring")
+    print("[rocm-racer] ══════════════════════════════════════════════════════")
 
-    # --- Setup: gamepad + PCSX2 ---
     write_controller_db()
     gamepad = VirtualGamepad()
     gamepad.open()
-    pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
+    statefile = args.statefile if args.statefile != DEFAULT_STATEFILE else CALIBRATION_STATEFILE
+    pcsx2_proc = launch_pcsx2(iso, statefile=statefile)
     wait_for_pcsx2_ready()
 
-    offsets = TelemetryOffsets(vehicle_struct_addr=1)  # dummy
+    offsets = TelemetryOffsets(vehicle_struct_addr=1)  # dummy to bypass open() guard
     reader = NFSU2MemoryReader(offsets=offsets)
     reader.open()
 
     try:
-        # ── Phase 1: stationary structural fingerprint ──
-        print("\n[calibrate] Phase 1: scanning stationary fingerprint (car must be stopped)...")
+        # ── Phase 1: differential scan (stopped → moving) ──
+        print("\n[calibrate] Phase 1: snapshot while stopped (car must be stationary)...")
         snap_stopped = reader.snapshot_ee_ram()
-        candidates = _phase1_stationary_scan(snap_stopped, STRUCT_MIN_SIZE)
-        print(f"[calibrate] Phase 1: {len(candidates):,} candidates after fingerprint filter")
 
-        if not candidates:
-            print("[calibrate] ERROR: No candidates found. Is the car stopped in-gear?")
-            return
-
-        # ── Phase 2: acceleration delta ──
-        print(f"\n[calibrate] Phase 2: accelerating for {ACCEL_TIME}s...")
+        print(f"[calibrate] Phase 1: accelerating for {ACCEL_TIME}s...")
         gamepad.hold_button(e.BTN_SOUTH)
         gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
         time.sleep(ACCEL_TIME)
-
         snap_moving = reader.snapshot_ee_ram()
-
         gamepad.release_button(e.BTN_SOUTH)
         gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-        candidates = _phase2_acceleration_verify(
-            snap_stopped, snap_moving, candidates
-        )
-        print(f"[calibrate] Phase 2: {len(candidates):,} candidates after acceleration filter")
+        speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_moving)
+        print(f"[calibrate] Phase 1: {len(speed_candidates):,} speed-float candidates")
 
-        if not candidates:
-            print("[calibrate] ERROR: No candidates survived acceleration filter.")
+        if not speed_candidates:
+            print("[calibrate] ERROR: No speed candidates found.")
+            print("[calibrate]   Make sure the car is fully stopped before the scan,")
+            print("              then reaches >75 km/h during acceleration.")
             return
 
-        # ── Phase 3: structural integrity scoring ──
-        print(f"\n[calibrate] Phase 3: scoring {len(candidates):,} candidates on structural integrity...")
-        scored = _phase3_integrity_score(snap_stopped, snap_moving, candidates)
+        # Show top candidates
+        print(f"[calibrate]   Top candidates (addr, value, unit):")
+        for addr, val, unit in speed_candidates[:10]:
+            print(f"    0x{addr:08X}  {val:8.3f} {unit}")
 
-        # Display results
-        print(f"\n[calibrate] ── Results ({'top 20' if len(scored) > 20 else 'all'}) ──")
-        print(f"  {'Score':>5}  {'Struct Base':>14}  "
-              f"{'Speed(stop)':>11}  {'Speed(move)':>11}  {'RPM(idle)':>9}  {'Quat Σ²':>7}")
-        print(f"  {'─' * 5}  {'─' * 14}  {'─' * 11}  {'─' * 11}  {'─' * 9}  {'─' * 7}")
-        for entry in scored[:20]:
-            print(
-                f"  {entry['score']:5d}  "
-                f"0x{entry['base']:08X}  "
-                f"{entry['speed_stopped']:11.4f}  "
-                f"{entry['speed_moving']:11.4f}  "
-                f"{entry['rpm_idle']:9.0f}  "
-                f"{entry['quat_sq']:7.4f}"
+        # ── Phase 2: quaternion search around each speed candidate ──
+        print(f"\n[calibrate] Phase 2: searching for quaternion anchor in ±0x200 of each candidate...")
+        best_speed_addr = None
+        best_quat_addr  = None
+        best_speed_val  = None
+        best_speed_unit = None
+
+        for speed_addr, speed_val, speed_unit in speed_candidates:
+            quats = _phase2_quaternion_search(snap_moving, speed_addr)
+            if quats:
+                best_quat_addr  = quats[0][0]
+                best_speed_addr = speed_addr
+                best_speed_val  = speed_val
+                best_speed_unit = speed_unit
+                print(f"[calibrate]   ✓ Speed @ 0x{speed_addr:08X} ({speed_val:.2f} {speed_unit}) "
+                      f"→ quaternion @ 0x{best_quat_addr:08X} (Σ²={quats[0][1]:.5f})")
+                break
+
+        if best_quat_addr is None:
+            print("[calibrate] ⚠  No quaternion found near any speed candidate.")
+            print("[calibrate]   Saving speed-only calibration — pos/vel unavailable.")
+            best_speed_addr = speed_candidates[0][0]
+            best_speed_val  = speed_candidates[0][1]
+            best_speed_unit = speed_candidates[0][2]
+        else:
+            # ── Phase 3: discover position and velocity offsets ──
+            print(f"\n[calibrate] Phase 3: discovering position/velocity offsets around quaternion...")
+            offsets_info = _phase3_discover_struct_offsets(
+                snap_stopped, snap_moving, best_speed_addr, best_quat_addr
             )
 
-        best = scored[0]
-        if best["score"] < 3:
-            print(f"\n[calibrate] ⚠ No high-confidence match (best score: {best['score']}).")
-            print("[calibrate] Try re-running calibration with a clean savestate.")
-            return
+            if offsets_info["vel_triplets"]:
+                vt = offsets_info["vel_triplets"][0]
+                print(f"[calibrate]   ✓ Velocity triplet: "
+                      f"0x{vt[0]:08X}, 0x{vt[1]:08X}, 0x{vt[2]:08X}")
+            else:
+                print("[calibrate]   ⚠  No velocity triplet found.")
 
-        vehicle_base = best["base"]
-        print(f"\n[calibrate] ✓ Best struct base: PS2 0x{vehicle_base:08X} "
-              f"(score {best['score']})")
+            if offsets_info["pos_triplets"]:
+                pt = offsets_info["pos_triplets"][0]
+                print(f"[calibrate]   ✓ Position triplet: "
+                      f"0x{pt[0]:08X}, 0x{pt[1]:08X}, 0x{pt[2]:08X}")
+            else:
+                print("[calibrate]   ⚠  No position triplet found.")
 
         # ── Phase 4: static pointer discovery ──
-        print("\n[calibrate] Phase 4: searching for static pointer...")
-        static_ptrs = _phase4_find_static_pointers(snap_moving, vehicle_base)
+        print(f"\n[calibrate] Phase 4: searching for static pointer to 0x{best_speed_addr:08X}...")
+        static_ptrs = _phase4_find_static_pointers(snap_moving, best_speed_addr)
 
         static_ptr_addr = 0
         if static_ptrs:
             static_ptr_addr = static_ptrs[0]
-            print(f"[calibrate] ✓ Found {len(static_ptrs)} static pointer(s):")
+            print(f"[calibrate]   ✓ Found {len(static_ptrs)} pointer(s):")
             for ptr in static_ptrs[:5]:
-                print(f"    0x{ptr:08X}")
-            print(f"[calibrate]   Using 0x{static_ptr_addr:08X}")
+                print(f"      0x{ptr:08X}")
         else:
-            print("[calibrate] ⚠ No static pointer found in 0x003X–0x005X range.")
-            print("[calibrate]   Saving direct address (may break on savestate reload).")
+            print("[calibrate]   ⚠  No static pointer found. Direct address saved.")
 
-        # ── Save calibration ──
-        cal_data = {
-            "vehicle_struct_addr": f"0x{vehicle_base:08X}",
+        # ── Save calibration.json ──
+        cal_data: dict = {
+            "vehicle_struct_addr": f"0x{best_speed_addr:08X}",
+            "speed_offset":        "0x0",
+            "speed_unit":          best_speed_unit,
+            "speed_value_sample":  best_speed_val,
         }
         if static_ptr_addr:
             cal_data["static_pointer_addr"] = f"0x{static_ptr_addr:08X}"
-        cal_data["calibration_score"] = best["score"]
+
+        if best_quat_addr is not None:
+            cal_data["quat_offset"] = f"0x{best_quat_addr - best_speed_addr:X}"
+            cal_data["quat_addr"]   = f"0x{best_quat_addr:08X}"
+
+            vel_triplets = offsets_info.get("vel_triplets", [])
+            if vel_triplets:
+                vt = vel_triplets[0]
+                cal_data["vel_x_offset"] = f"0x{vt[0] - best_speed_addr:X}"
+                cal_data["vel_y_offset"] = f"0x{vt[1] - best_speed_addr:X}"
+                cal_data["vel_z_offset"] = f"0x{vt[2] - best_speed_addr:X}"
+
+            pos_triplets = offsets_info.get("pos_triplets", [])
+            if pos_triplets:
+                pt = pos_triplets[0]
+                cal_data["pos_x_offset"] = f"0x{pt[0] - best_speed_addr:X}"
+                cal_data["pos_y_offset"] = f"0x{pt[1] - best_speed_addr:X}"
+                cal_data["pos_z_offset"] = f"0x{pt[2] - best_speed_addr:X}"
 
         CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CALIBRATION_FILE, "w") as f:
             json.dump(cal_data, f, indent=2)
-        print(f"\n[calibrate] Saved to {CALIBRATION_FILE}")
-        print(f"[calibrate] Use with:  python main.py --telemetry")
+        print(f"\n[calibrate] ✓ Saved to {CALIBRATION_FILE}")
+        print(f"[calibrate]   Run `python main.py --telemetry` to verify.")
 
     finally:
         reader.close()
@@ -334,174 +370,122 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 # Calibration phase helpers
 # ---------------------------------------------------------------------------
 
-def _phase1_stationary_scan(data: bytes, struct_min_size: int) -> list[int]:
-    """Phase 1: find 16-byte-aligned bases matching a stationary vehicle.
+def _phase1_find_speed_candidates(
+    data_stopped: bytes,
+    data_moving: bytes,
+) -> list[tuple[int, float, str]]:
+    """Phase 1: find speed float via differential scan.
 
-    Checks: speed≈0, velocity≈(0,0,0), gear=1, quaternion normalized,
-    position finite and in valid world range.
+    Finds Float32 addresses that were ~0.0 when stopped and are now in
+    either m/s range (15-35) or km/h range (75-110) while moving.
+    No struct offset or alignment assumptions.
 
-    Returns candidate base addresses (PS2 byte offsets).
+    Returns list of (ps2_addr, value_moving, unit_hint) tuples.
+    """
+    f32_s = np.frombuffer(data_stopped, dtype=np.float32)
+    f32_m = np.frombuffer(data_moving, dtype=np.float32)
+
+    near_zero   = np.isfinite(f32_s) & (np.abs(f32_s) < 0.5)
+    in_ms_range  = np.isfinite(f32_m) & (f32_m >= 15.0) & (f32_m <= 35.0)
+    in_kph_range = np.isfinite(f32_m) & (f32_m >= 75.0) & (f32_m <= 110.0)
+
+    results: list[tuple[int, float, str]] = []
+    for idx in np.where(near_zero & (in_ms_range | in_kph_range))[0]:
+        addr = int(idx) * 4
+        val  = float(f32_m[idx])
+        unit = "m/s" if 15.0 <= val <= 35.0 else "km/h"
+        results.append((addr, val, unit))
+
+    return results
+
+
+def _phase2_quaternion_search(
+    data: bytes,
+    speed_addr: int,
+    window: int = 0x200,
+) -> list[tuple[int, float]]:
+    """Phase 2: find normalized quaternion in ±window bytes around speed_addr.
+
+    A quaternion is 4 adjacent Float32s where sum of squares ≈ 1.0.
+    Returns list of (quat_base_addr, quat_sq) sorted by closeness to 1.0.
     """
     from memory_readers.nfsu2_memory import _EE_RAM_SIZE
 
-    f32 = np.frombuffer(data, dtype=np.float32)
-    i32 = np.frombuffer(data, dtype=np.int32)
+    start = max(0, speed_addr - window) & ~3
+    end   = min(_EE_RAM_SIZE - 16, speed_addr + window)
 
-    max_base = _EE_RAM_SIZE - struct_min_size
-    # 16-byte aligned candidates (every 4 float32 slots)
-    bases = np.arange(0, max_base, 16, dtype=np.int64)
+    f32     = np.frombuffer(data, dtype=np.float32)
+    results: list[tuple[int, float]] = []
 
-    def f_at(offset: int) -> np.ndarray:
-        return f32[(bases + offset) // 4]
+    for byte_off in range(start, end - 12, 4):
+        idx = byte_off // 4
+        if idx + 3 >= len(f32):
+            break
+        vals = f32[idx:idx + 4]
+        if not np.all(np.isfinite(vals)):
+            continue
+        sq = float(np.sum(vals * vals))
+        if 0.98 < sq < 1.02:
+            results.append((byte_off, sq))
 
-    def i_at(offset: int) -> np.ndarray:
-        return i32[(bases + offset) // 4]
-
-    mask = np.ones(len(bases), dtype=bool)
-
-    # Speed ≈ 0 when stopped
-    speed = f_at(0x090)
-    mask &= np.isfinite(speed) & (np.abs(speed) < 0.5)
-
-    # Velocity ≈ (0, 0, 0)
-    for off in (0x070, 0x074, 0x078):
-        v = f_at(off)
-        mask &= np.isfinite(v) & (np.abs(v) < 0.1)
-
-    # Gear = 1 (in-drive, stationary)
-    mask &= i_at(0x164) == 1
-
-    # Quaternion at +0x030: 4 floats, sum of squares ≈ 1.0
-    r = [f_at(0x030 + i * 4) for i in range(4)]
-    quat_sq = sum(ri * ri for ri in r)
-    mask &= np.isfinite(quat_sq) & (quat_sq > 0.9) & (quat_sq < 1.1)
-
-    # Position: finite and in valid world range
-    for off in (0x020, 0x024, 0x028):
-        p = f_at(off)
-        mask &= np.isfinite(p) & (np.abs(p) < 100_000)
-
-    return bases[mask].tolist()
+    results.sort(key=lambda x: abs(x[1] - 1.0))
+    return results
 
 
-def _phase2_acceleration_verify(
+def _phase3_discover_struct_offsets(
     data_stopped: bytes,
     data_moving: bytes,
-    candidates: list[int],
-) -> list[int]:
-    """Phase 2: keep candidates that show realistic acceleration behavior.
+    speed_addr: int,
+    quat_addr: int,
+    window: int = 0x100,
+) -> dict:
+    """Phase 3: empirically discover position and velocity offsets.
 
-    Checks: speed>0, velocity non-zero in XZ, RPM in engine range,
-    gear still 1, position horizontally changed.
-    """
-    f32_s = np.frombuffer(data_stopped, dtype=np.float32)
-    f32_m = np.frombuffer(data_moving, dtype=np.float32)
-    i32_m = np.frombuffer(data_moving, dtype=np.int32)
+    Scans ±window around the quaternion anchor for:
+    - Velocity: 3 floats near-zero when stopped, non-zero while moving
+    - Position: 3 floats with world-scale values (1-100000), stable but changed
 
-    bases = np.array(candidates, dtype=np.int64)
-
-    def f_at(arr: np.ndarray, offset: int) -> np.ndarray:
-        return arr[(bases + offset) // 4]
-
-    def i_at(arr: np.ndarray, offset: int) -> np.ndarray:
-        return arr[(bases + offset) // 4]
-
-    mask = np.ones(len(bases), dtype=bool)
-
-    # Speed now positive and < 30 m/s (~108 km/h, first-gear range)
-    speed = f_at(f32_m, 0x090)
-    mask &= np.isfinite(speed) & (speed > 0.1) & (speed < 30.0)
-
-    # Velocity has non-zero horizontal component
-    vel_x = f_at(f32_m, 0x070)
-    vel_z = f_at(f32_m, 0x078)
-    mask &= (np.abs(vel_x) > 0.01) | (np.abs(vel_z) > 0.01)
-
-    # RPM in engine range
-    rpm = f_at(f32_m, 0x160)
-    mask &= np.isfinite(rpm) & (rpm >= 500) & (rpm <= 12000)
-
-    # Gear still = 1 (should not have shifted in 3s from standstill)
-    mask &= i_at(i32_m, 0x164) == 1
-
-    # Position moved horizontally since stopped
-    pos_x_s = f_at(f32_s, 0x020)
-    pos_z_s = f_at(f32_s, 0x028)
-    pos_x_m = f_at(f32_m, 0x020)
-    pos_z_m = f_at(f32_m, 0x028)
-    horiz_dist_sq = (pos_x_m - pos_x_s) ** 2 + (pos_z_m - pos_z_s) ** 2
-    mask &= np.isfinite(horiz_dist_sq) & (horiz_dist_sq > 1.0)
-
-    return bases[mask].tolist()
-
-
-def _phase3_integrity_score(
-    data_stopped: bytes,
-    data_moving: bytes,
-    candidates: list[int],
-) -> list[dict]:
-    """Phase 3: score candidates on structural integrity.
-
-    Higher score = more likely to be the real player vehicle struct.
+    Returns dict with vel_triplets, pos_triplets, and raw candidate lists.
     """
     import math
+    from memory_readers.nfsu2_memory import _EE_RAM_SIZE
 
     f32_s = np.frombuffer(data_stopped, dtype=np.float32)
     f32_m = np.frombuffer(data_moving, dtype=np.float32)
 
-    results: list[dict] = []
-    for base in candidates:
-        score = 0
+    start = max(0, quat_addr - window) & ~3
+    end   = min(_EE_RAM_SIZE - 4, quat_addr + window)
 
-        def _f(arr: np.ndarray, off: int) -> float:
-            return float(arr[(base + off) // 4])
+    vel_candidates: list[tuple[int, float, float]] = []
+    pos_candidates: list[tuple[int, float, float]] = []
 
-        # Quaternion precision (tighter tolerance)
-        r = [_f(f32_s, 0x030 + i * 4) for i in range(4)]
-        quat_sq = sum(v * v for v in r)
-        if 0.99 < quat_sq < 1.01:
-            score += 2
-        elif 0.95 < quat_sq < 1.05:
-            score += 1
+    for byte_off in range(start, end, 4):
+        idx = byte_off // 4
+        if idx >= len(f32_s) or idx >= len(f32_m):
+            break
+        vs = float(f32_s[idx])
+        vm = float(f32_m[idx])
+        if not (math.isfinite(vs) and math.isfinite(vm)):
+            continue
+        if abs(vs) < 0.1 and abs(vm) > 0.5:
+            vel_candidates.append((byte_off, vs, vm))
+        if 1.0 < abs(vs) < 100_000 and 1.0 < abs(vm) < 100_000:
+            pos_candidates.append((byte_off, vs, vm))
 
-        # RPM idle when stopped (~800-1200, not 0 or garbage)
-        rpm_idle = _f(f32_s, 0x160)
-        if math.isfinite(rpm_idle) and 500 <= rpm_idle <= 1500:
-            score += 2
+    def _triplets(addrs: list[int]) -> list[tuple[int, int, int]]:
+        out = []
+        for i in range(len(addrs) - 2):
+            a, b, c = addrs[i], addrs[i+1], addrs[i+2]
+            if b == a + 4 and c == b + 4:
+                out.append((a, b, c))
+        return out
 
-        # Speed exactly 0 when stopped
-        speed_stopped = _f(f32_s, 0x090)
-        if abs(speed_stopped) < 0.01:
-            score += 1
-
-        # Speed while moving is realistic
-        speed_moving = _f(f32_m, 0x090)
-        if 1.0 <= speed_moving <= 25.0:
-            score += 1
-
-        # RPM while moving in driving range
-        rpm_moving = _f(f32_m, 0x160)
-        if math.isfinite(rpm_moving) and 2000 <= rpm_moving <= 8000:
-            score += 1
-
-        # Vertical position roughly unchanged (not falling/flying)
-        pos_y_s = _f(f32_s, 0x024)
-        pos_y_m = _f(f32_m, 0x024)
-        if math.isfinite(pos_y_s) and math.isfinite(pos_y_m):
-            if abs(pos_y_m - pos_y_s) < 2.0:
-                score += 1
-
-        results.append({
-            "base": base,
-            "score": score,
-            "speed_stopped": speed_stopped,
-            "speed_moving": speed_moving,
-            "rpm_idle": rpm_idle,
-            "quat_sq": quat_sq,
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
+    return {
+        "vel_triplets": _triplets(sorted(a for a, _, _ in vel_candidates)),
+        "pos_triplets": _triplets(sorted(a for a, _, _ in pos_candidates)),
+        "vel_candidates": vel_candidates[:20],
+        "pos_candidates": pos_candidates[:20],
+    }
 
 
 def _phase4_find_static_pointers(data: bytes, vehicle_base: int) -> list[int]:
@@ -509,11 +493,10 @@ def _phase4_find_static_pointers(data: bytes, vehicle_base: int) -> list[int]:
 
     Searches all 32 MB for uint32 values matching the vehicle base address
     (with and without kseg mirror bits).  Returns addresses in the static
-    data range (0x003XXXXX–0x005XXXXX), sorted by address.
+    data range (0x003XXXXX-0x005XXXXX), sorted by address.
     """
     u32 = np.frombuffer(data, dtype=np.uint32)
 
-    # The game may store the address as physical (kuseg) or kseg0/kseg1
     targets = np.array([
         vehicle_base,
         vehicle_base | 0x80000000,   # kseg0
