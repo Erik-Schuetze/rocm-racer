@@ -251,10 +251,10 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from memory_readers.virtual_gamepad import VirtualGamepad
     from evdev import ecodes as e
 
-    BRAKE_TIME = 3.0     # seconds to hold brake (decelerate, not reverse)
-    COAST_TIME = 5.0     # seconds to wait with no input for car to reach 0
-    ACCEL_TIME = 5.0     # seconds to hold accelerate
-    MAX_CYCLES = 3       # max accel/brake narrowing cycles
+    BRAKE_TIME = 1.5     # seconds to hold brake (decelerate, not reverse)
+    COAST_TIME = 3.0     # seconds to wait with no input for car to reach 0
+    ACCEL_TIME = 2.0     # seconds to hold accelerate
+    MAX_CYCLES = 5       # max accel/brake narrowing cycles
     TARGET_CANDIDATES = 50  # stop narrowing when we reach this many
 
     print("[rocm-racer] ══════════════════════════════════════════════")
@@ -274,71 +274,78 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 
     candidates: list[int] | None = None
 
+    def _stop_car() -> None:
+        """Brake briefly then coast to a full stop."""
+        gamepad.hold_button(e.BTN_WEST)
+        gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
+        time.sleep(BRAKE_TIME)
+        gamepad.release_button(e.BTN_WEST)
+        gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+        time.sleep(COAST_TIME)
+
     try:
         for cycle in range(1, MAX_CYCLES + 1):
-            # --- Phase 1: brake to slow down, then coast to full stop ---
-            # Square (BTN_WEST) is "Brake/Reverse" — holding it while
-            # stopped makes the car reverse, so we brake briefly then
-            # release everything and wait for the car to coast to speed 0.
+            # --- Stop the car ---
             print(f"\n[calibrate] Cycle {cycle}/{MAX_CYCLES} — stopping car...")
-            gamepad.hold_button(e.BTN_WEST)       # Square = brake
-            gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
-            time.sleep(BRAKE_TIME)
-            gamepad.release_button(e.BTN_WEST)
-            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-            print(f"[calibrate] Coasting to zero for {COAST_TIME}s...")
-            time.sleep(COAST_TIME)
+            _stop_car()
 
-            # --- Phase 2: snapshot while stopped ---
-            print("[calibrate] Snapshotting EE RAM (car stopped)...")
+            # --- Snapshot while stopped ---
+            print("[calibrate] Snapshot (stopped)...")
             snap_stopped = reader.snapshot_ee_ram()
 
-            # --- Phase 3: accelerate ---
+            # --- "Unchanged while stopped" filter: take a second stopped
+            # snapshot after a short wait to eliminate timers/counters that
+            # keep changing even when the car is stationary. ---
+            time.sleep(1.0)
+            print("[calibrate] Snapshot (still stopped)...")
+            snap_stopped_2 = reader.snapshot_ee_ram()
+            results = NFSU2MemoryReader.diff_scan(
+                snap_stopped, snap_stopped_2, "unchanged", candidates
+            )
+            prev_count = len(candidates) if candidates else "all"
+            candidates = [addr for addr, _, _ in results]
+            print(f"[calibrate] Filter 'unchanged@stop': {prev_count} → {len(candidates):,}")
+
+            if len(candidates) <= TARGET_CANDIDATES:
+                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
+                break
+
+            # --- Accelerate ---
             print(f"[calibrate] Accelerating for {ACCEL_TIME}s...")
-            gamepad.hold_button(e.BTN_SOUTH)       # Cross = accelerate
+            gamepad.hold_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(ACCEL_TIME)
 
-            # --- Phase 4: snapshot while moving ---
-            print("[calibrate] Snapshotting EE RAM (car moving)...")
+            # --- Snapshot while moving ---
+            print("[calibrate] Snapshot (moving)...")
             snap_moving = reader.snapshot_ee_ram()
 
-            # --- Phase 5: diff → "increased" ---
-            results = NFSU2MemoryReader.diff_scan(
-                snap_stopped, snap_moving, "increased", candidates
-            )
-            candidates = [addr for addr, _, _ in results]
-            prev_label = "all" if cycle == 1 else "prev"
-            print(f"[calibrate] Filter 'increased': {prev_label} → {len(candidates):,} candidates")
-
-            # Release accelerate
             gamepad.release_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-            if len(candidates) <= TARGET_CANDIDATES:
-                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates — skipping further cycles.")
-                break
-
-            # --- Phase 6: stop the car again ---
-            print(f"[calibrate] Braking for {BRAKE_TIME}s...")
-            gamepad.hold_button(e.BTN_WEST)
-            gamepad.send(steering=0.0, throttle=0.0, brake=1.0)
-            time.sleep(BRAKE_TIME)
-            gamepad.release_button(e.BTN_WEST)
-            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
-            print(f"[calibrate] Coasting to zero for {COAST_TIME}s...")
-            time.sleep(COAST_TIME)
-
-            # --- Phase 7: snapshot while stopped again ---
-            print("[calibrate] Snapshotting EE RAM (car stopped again)...")
-            snap_stopped2 = reader.snapshot_ee_ram()
-
-            # --- Phase 8: diff → "decreased" ---
+            # --- Filter: increased (stopped → moving) ---
             results = NFSU2MemoryReader.diff_scan(
-                snap_moving, snap_stopped2, "decreased", candidates
+                snap_stopped_2, snap_moving, "increased", candidates
             )
             candidates = [addr for addr, _, _ in results]
-            print(f"[calibrate] Filter 'decreased': → {len(candidates):,} candidates")
+            print(f"[calibrate] Filter 'increased': → {len(candidates):,}")
+
+            if len(candidates) <= TARGET_CANDIDATES:
+                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
+                break
+
+            # --- Stop again and filter decreased ---
+            print("[calibrate] Stopping car again...")
+            _stop_car()
+
+            print("[calibrate] Snapshot (stopped again)...")
+            snap_stopped_3 = reader.snapshot_ee_ram()
+
+            results = NFSU2MemoryReader.diff_scan(
+                snap_moving, snap_stopped_3, "decreased", candidates
+            )
+            candidates = [addr for addr, _, _ in results]
+            print(f"[calibrate] Filter 'decreased': → {len(candidates):,}")
 
             if len(candidates) <= TARGET_CANDIDATES:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
