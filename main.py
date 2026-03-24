@@ -169,6 +169,8 @@ def parse_args() -> argparse.Namespace:
                         help="Save a model checkpoint every N timesteps (default: 10000)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="PyTorch device for training (default: cuda)")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="Disable the live OpenCV preview window during training")
     return parser.parse_args()
 
 
@@ -1040,9 +1042,10 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     from pathlib import Path as _Path
 
     from stable_baselines3 import PPO
-    from stable_baselines3.common.callbacks import CheckpointCallback
+    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 
     from agents.feature_extractor import MultimodalExtractor
+    from agents.training_monitor import TrainingMonitorCallback
     from environments.pcsx2_env import PCSX2EnvConfig, PCSX2RacerEnv
     from memory_readers.frame_capture import FrameCapture, FrameCaptureConfig
     from memory_readers.nfsu2_memory import NFSU2MemoryReader
@@ -1105,6 +1108,14 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         verbose=1,
     )
 
+    monitor_cb = TrainingMonitorCallback(
+        preview=not args.no_preview,
+        preview_scale=4,
+        preview_interval=5,
+    )
+
+    callbacks = CallbackList([checkpoint_cb, monitor_cb])
+
     model = PPO(
         "MultiInputPolicy",
         env,
@@ -1124,12 +1135,14 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     print(f"[train] Starting PPO training for {args.timesteps:,} timesteps...")
     print(f"[train] Checkpoints → {models_dir}/")
     print(f"[train] TensorBoard → {tb_log}")
+    if not args.no_preview:
+        print("[train] Preview window: 'rocm-racer' (green=steering, red=accel/brake)")
     print("[train] Press Ctrl-C to stop and save final model.\n")
 
     try:
         model.learn(
             total_timesteps=args.timesteps,
-            callback=checkpoint_cb,
+            callback=callbacks,
             tb_log_name="ppo_nfsu2",
             reset_num_timesteps=True,
         )

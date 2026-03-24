@@ -24,3 +24,6 @@ evdev>=1.7.0
 # Uses grim (already installed) + hyprctl for automatic PCSX2 window
 # discovery. No portal dialogs — works unattended across gym resets.
 Pillow>=11.0.0
+
+# Observability: live preview window for training
+opencv-python>=4.8.0
