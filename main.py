@@ -252,8 +252,8 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     BRAKE_TIME = 1.5     # seconds to hold brake (decelerate, not reverse)
-    COAST_TIME = 4.0     # seconds to wait with no input for car to reach 0
-    ACCEL_TIME = 2.0     # seconds to hold accelerate
+    COAST_TIME = 6.0     # seconds to wait with no input for car to reach 0
+    ACCEL_TIME = 3.0     # seconds to hold accelerate
     MAX_CYCLES = 5       # max accel/brake narrowing cycles
     TARGET_CANDIDATES = 50  # stop narrowing when we reach this many
 
@@ -313,6 +313,8 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             # --- Snapshot while moving (button still held) ---
             print("[calibrate] Snapshot (moving)...")
             snap_moving = reader.snapshot_ee_ram()
+            time.sleep(1.0)
+            snap_moving_2 = reader.snapshot_ee_ram()
 
             gamepad.release_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
@@ -323,6 +325,18 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             )
             candidates = [addr for addr, _, _ in results]
             print(f"[calibrate] Filter 'increased': → {len(candidates):,}")
+
+            if len(candidates) <= TARGET_CANDIDATES:
+                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
+                break
+
+            # --- Filter: unchanged while moving (eliminates frame
+            # counters and animation state that keep changing) ---
+            results = NFSU2MemoryReader.diff_scan(
+                snap_moving, snap_moving_2, "unchanged", candidates
+            )
+            candidates = [addr for addr, _, _ in results]
+            print(f"[calibrate] Filter 'unchanged@moving': → {len(candidates):,}")
 
             if len(candidates) <= TARGET_CANDIDATES:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
