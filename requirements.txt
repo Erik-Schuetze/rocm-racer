@@ -18,3 +18,10 @@ numpy>=1.26.0
 
 # Linux virtual input device (virtual gamepad — requires /dev/uinput access)
 evdev>=1.7.0
+
+# Vision pipeline (Wayland frame capture + image processing)
+# pipewire-capture requires: pipewire, wireplumber, xdg-desktop-portal,
+#   and a portal backend (e.g. xdg-desktop-portal-hyprland).
+#   A one-time consent dialog appears the first time the portal is opened.
+pipewire-capture>=0.2.9
+Pillow>=11.0.0

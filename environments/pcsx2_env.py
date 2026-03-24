@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -59,12 +59,14 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         memory_reader: NFSU2MemoryReader | None = None,
         gamepad: VirtualGamepad | None = None,
         config: PCSX2EnvConfig | None = None,
+        frame_capture=None,   # Optional[FrameCapture]
         sleep_fn=time.sleep,
     ) -> None:
         super().__init__()
         self.config = config or PCSX2EnvConfig()
         self.memory_reader = memory_reader or NFSU2MemoryReader()
         self.gamepad = gamepad or VirtualGamepad()
+        self.frame_capture = frame_capture
         self.sleep_fn = sleep_fn
         self.device = torch.device(self.config.device)
 
@@ -73,17 +75,28 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             high=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Box(
+
+        # Telemetry-only observation: [speed_kph, x, y, z, track_progress]
+        telemetry_space = spaces.Box(
             low=np.asarray(
-                [-500.0, -1_000_000.0, -1_000_000.0, -1_000_000.0, -360.0, -360.0, -360.0, 0.0],
+                [0.0, -1_000_000.0, -1_000_000.0, -1_000_000.0, 0.0],
                 dtype=np.float32,
             ),
             high=np.asarray(
-                [500.0, 1_000_000.0, 1_000_000.0, 1_000_000.0, 360.0, 360.0, 360.0, 1_000_000.0],
+                [500.0, 1_000_000.0, 1_000_000.0, 1_000_000.0, 1_000_000.0],
                 dtype=np.float32,
             ),
             dtype=np.float32,
         )
+
+        if self.frame_capture is not None:
+            n, h, w = self.frame_capture.observation_shape
+            self.observation_space = spaces.Dict({
+                "image": spaces.Box(0, 255, shape=(n, h, w), dtype=np.uint8),
+                "telemetry": telemetry_space,
+            })
+        else:
+            self.observation_space = telemetry_space
 
         self._episode_steps = 0
         self._last_telemetry: TelemetrySample | None = None
@@ -103,7 +116,16 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps = 0
         self._last_telemetry = self.memory_reader.read_telemetry()
 
-        observation = self._last_telemetry.as_observation()
+        if self.frame_capture is not None:
+            self.frame_capture.reset_stack()
+            image = self.frame_capture.step()
+            observation = {
+                "image": image,
+                "telemetry": self._last_telemetry.as_observation(),
+            }
+        else:
+            observation = self._last_telemetry.as_observation()
+
         info = self._build_info(self._last_telemetry, reward=0.0, reward_terms={})
         return observation, info
 
@@ -126,7 +148,16 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps += 1
         terminated = bool(telemetry.wall_collision_flag)
         truncated = self._episode_steps >= self.config.max_episode_steps
-        observation = telemetry.as_observation()
+
+        if self.frame_capture is not None:
+            image = self.frame_capture.step()
+            observation = {
+                "image": image,
+                "telemetry": telemetry.as_observation(),
+            }
+        else:
+            observation = telemetry.as_observation()
+
         info = self._build_info(telemetry, reward=reward, reward_terms=reward_terms)
 
         self._last_telemetry = telemetry
@@ -135,6 +166,8 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
     def close(self) -> None:
         self.gamepad.close()
         self.memory_reader.close()
+        if self.frame_capture is not None:
+            self.frame_capture.close()
 
     def observation_tensor(self, telemetry: TelemetrySample | None = None) -> torch.Tensor:
         sample = telemetry or self._last_telemetry
@@ -192,7 +225,6 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             "episode_steps": self._episode_steps,
             "speed_kph": telemetry.speed_kph,
             "position": telemetry.position,
-            "rotation": telemetry.rotation,
             "track_progress": telemetry.track_progress,
             "reverse_flag": telemetry.reverse_flag,
             "wall_collision_flag": telemetry.wall_collision_flag,

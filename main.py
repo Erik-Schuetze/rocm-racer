@@ -161,6 +161,8 @@ def parse_args() -> argparse.Namespace:
                         help="Filter for --scan-diff (default: changed)")
     parser.add_argument("--scan-reset", action="store_true",
                         help="Clear the candidate list and start fresh")
+    parser.add_argument("--vision", action="store_true",
+                        help="Test frame capture pipeline (PipeWire portal, saves sample frame)")
     return parser.parse_args()
 
 
@@ -196,6 +198,11 @@ def main() -> None:
     # --- Telemetry mode: no gamepad needed, just read and log ---
     if args.telemetry:
         _run_telemetry(args, iso)
+        return
+
+    # --- Vision test mode: capture frames from PCSX2 ---
+    if args.vision:
+        _run_vision(args, iso)
         return
 
     # --- Default: test mode (gamepad accelerate) ---
@@ -931,6 +938,75 @@ def _run_telemetry(args: argparse.Namespace, iso: Path) -> None:
                 pass
             gamepad.close()
         reader.close()
+        if pcsx2_proc is not None:
+            pcsx2_proc.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Mode: --vision
+# ---------------------------------------------------------------------------
+
+def _run_vision(args: argparse.Namespace, iso: Path) -> None:
+    """
+    Test the frame-capture pipeline against a running PCSX2 instance.
+
+    Launches PCSX2 with the calibration savestate, opens the PipeWire
+    portal (shows consent dialog once), then captures frames in a loop
+    while printing FPS stats.  Saves the first valid frame to
+    saves/vision_sample.png for visual inspection.
+    """
+    from memory_readers.frame_capture import FrameCapture, FrameCaptureConfig
+
+    pcsx2_proc: subprocess.Popen | None = None
+
+    if not args.no_launch:
+        write_controller_db()
+        from memory_readers.virtual_gamepad import VirtualGamepad
+        gamepad = VirtualGamepad()
+        gamepad.open()
+        pcsx2_proc = launch_pcsx2(iso, statefile=CALIBRATION_STATEFILE)
+        wait_for_pcsx2_ready()
+
+    cfg = FrameCaptureConfig()
+    fc = FrameCapture(cfg)
+
+    print(f"[vision] Opening PipeWire portal — select the PCSX2 window when prompted.")
+    fc.open()
+    print(f"[vision] Capture open. obs shape: {fc.observation_shape}. Press Ctrl-C to stop.\n")
+
+    sample_path = Path("saves/vision_sample.png")
+    sample_saved = False
+    frame_count = 0
+    t_start = time.monotonic()
+
+    try:
+        while True:
+            obs = fc.step()          # (N, H, W) uint8
+            frame_count += 1
+
+            if not sample_saved:
+                # Save the most-recent single frame for inspection
+                from PIL import Image as PILImage
+                PILImage.fromarray(obs[-1]).save(sample_path)
+                print(f"[vision] Sample frame saved → {sample_path}")
+                sample_saved = True
+
+            elapsed = time.monotonic() - t_start
+            fps = frame_count / elapsed if elapsed > 0 else 0.0
+            print(
+                f"\r[vision] frames={frame_count:5d}  fps={fps:5.1f}  "
+                f"obs={obs.shape} dtype={obs.dtype}",
+                end="",
+                flush=True,
+            )
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print()
+    finally:
+        fc.close()
+        if not args.no_launch:
+            gamepad.close()
         if pcsx2_proc is not None:
             pcsx2_proc.terminate()
 
