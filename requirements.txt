@@ -20,8 +20,6 @@ numpy>=1.26.0
 evdev>=1.7.0
 
 # Vision pipeline (Wayland frame capture + image processing)
-# pipewire-capture requires: pipewire, wireplumber, xdg-desktop-portal,
-#   and a portal backend (e.g. xdg-desktop-portal-hyprland).
-#   A one-time consent dialog appears the first time the portal is opened.
-pipewire-capture>=0.2.9
+# Uses grim (already installed) + hyprctl for automatic PCSX2 window
+# discovery. No portal dialogs — works unattended across gym resets.
 Pillow>=11.0.0

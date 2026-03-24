@@ -964,15 +964,15 @@ def _run_vision(args: argparse.Namespace, iso: Path) -> None:
         from memory_readers.virtual_gamepad import VirtualGamepad
         gamepad = VirtualGamepad()
         gamepad.open()
-        pcsx2_proc = launch_pcsx2(iso, statefile=CALIBRATION_STATEFILE)
+        pcsx2_proc = launch_pcsx2(iso, statefile=args.statefile)
         wait_for_pcsx2_ready()
 
     cfg = FrameCaptureConfig()
     fc = FrameCapture(cfg)
 
-    print(f"[vision] Opening PipeWire portal — select the PCSX2 window when prompted.")
+    print(f"[vision] Locating PCSX2 window...")
     fc.open()
-    print(f"[vision] Capture open. obs shape: {fc.observation_shape}. Press Ctrl-C to stop.\n")
+    print(f"[vision] Capture ready. obs shape: {fc.observation_shape}. Press Ctrl-C to stop.\n")
 
     sample_path = Path("saves/vision_sample.png")
     sample_saved = False
