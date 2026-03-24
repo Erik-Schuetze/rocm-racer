@@ -451,13 +451,14 @@ def _score_candidates(
         except (RuntimeError, OSError):
             continue
 
-    # --- Accelerate and take 3 speed samples over 3s ---
-    print("[calibrate] Verification: accelerating for 3s (3 samples)...")
-    gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+    # --- Accelerate at varying throttle and take 3 speed samples ---
+    throttle_steps = [0.1, 0.25, 0.5]
+    print(f"[calibrate] Verification: throttle steps {throttle_steps}...")
 
     speed_samples: dict[int, list[float]] = {a: [] for a in stopped}
-    for _ in range(3):
-        time.sleep(1.0)
+    for throttle in throttle_steps:
+        gamepad.send(steering=0.0, throttle=throttle, brake=0.0)
+        time.sleep(1.5)
         for speed_addr in stopped:
             try:
                 speed_samples[speed_addr].append(reader._read_f32(speed_addr))
