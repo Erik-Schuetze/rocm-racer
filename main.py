@@ -252,7 +252,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     BRAKE_TIME = 1.5     # seconds to hold brake (decelerate, not reverse)
-    COAST_TIME = 3.0     # seconds to wait with no input for car to reach 0
+    COAST_TIME = 4.0     # seconds to wait with no input for car to reach 0
     ACCEL_TIME = 2.0     # seconds to hold accelerate
     MAX_CYCLES = 5       # max accel/brake narrowing cycles
     TARGET_CANDIDATES = 50  # stop narrowing when we reach this many
@@ -316,7 +316,7 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(ACCEL_TIME)
 
-            # --- Snapshot while moving ---
+            # --- Snapshot while moving (button still held) ---
             print("[calibrate] Snapshot (moving)...")
             snap_moving = reader.snapshot_ee_ram()
 
@@ -335,17 +335,35 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
                 break
 
             # --- Stop again and filter decreased ---
-            print("[calibrate] Stopping car again...")
+            # Snapshot promptly after stopping so the two snapshots
+            # (moving vs stopped) are close in time, reducing noise
+            # from unrelated game-state changes.
+            print("[calibrate] Stopping car...")
             _stop_car()
 
             print("[calibrate] Snapshot (stopped again)...")
             snap_stopped_3 = reader.snapshot_ee_ram()
+
+            # Also grab a second stopped snapshot for an extra
+            # "unchanged@stop" pass to further cull noisy addresses.
+            time.sleep(1.0)
+            snap_stopped_3b = reader.snapshot_ee_ram()
 
             results = NFSU2MemoryReader.diff_scan(
                 snap_moving, snap_stopped_3, "decreased", candidates
             )
             candidates = [addr for addr, _, _ in results]
             print(f"[calibrate] Filter 'decreased': → {len(candidates):,}")
+
+            if len(candidates) <= TARGET_CANDIDATES:
+                print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
+                break
+
+            results = NFSU2MemoryReader.diff_scan(
+                snap_stopped_3, snap_stopped_3b, "unchanged", candidates
+            )
+            candidates = [addr for addr, _, _ in results]
+            print(f"[calibrate] Filter 'unchanged@stop2': → {len(candidates):,}")
 
             if len(candidates) <= TARGET_CANDIDATES:
                 print(f"[calibrate] Reached ≤{TARGET_CANDIDATES} candidates.")
