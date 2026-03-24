@@ -1200,10 +1200,9 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             time.sleep(0.5)
             readers.append(reader)
 
-            # 4. Frame capture with PID-based matching
+            # 4. Frame capture — create but don't open yet (windows not tiled)
             fc_cfg = FrameCaptureConfig(pcsx2_pid=cfg.pcsx2_pid)
             fc = FrameCapture(fc_cfg)
-            fc.open()
             frame_captures.append(fc)
 
             env = PCSX2RacerEnv(
@@ -1212,8 +1211,12 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             )
             envs.append(env)
 
-        # Tile windows and build threaded vec env
+        # Tile windows FIRST, then open frame captures with final positions
         instance_mgr.tile_windows()
+        time.sleep(0.5)  # let Hyprland finish repositioning
+        for fc in frame_captures:
+            fc.open()
+
         vec_env = ThreadedVecEnv(envs)
         print(f"[train] {num_envs} environments ready.")
 
