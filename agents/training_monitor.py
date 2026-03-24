@@ -65,6 +65,9 @@ class TrainingMonitorCallback(BaseCallback):
         self._ep_max_dist: float = 0.0
         self._last_reason: str = ""
 
+        # Gradient update tracking
+        self._update_count = 0
+
         # Current action (updated each step for the preview overlay)
         self._last_action: np.ndarray = np.zeros(2, dtype=np.float32)
 
@@ -72,6 +75,8 @@ class TrainingMonitorCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         self._ep_start = time.monotonic()
+        n_steps = getattr(self.model, "n_steps", "?")
+        print(f"[monitor] Rollout size: {n_steps} steps per gradient update")
         if self._preview:
             cv2.namedWindow("rocm-racer", cv2.WINDOW_NORMAL)
             cv2.resizeWindow(
@@ -79,6 +84,15 @@ class TrainingMonitorCallback(BaseCallback):
                 96 * self._preview_scale,
                 96 * self._preview_scale,
             )
+
+    def _on_rollout_end(self) -> None:
+        self._update_count += 1
+        total_ts = self.num_timesteps
+        print(
+            f"[update {self._update_count:3d}]"
+            f"  {total_ts:,} total steps"
+            f"  — gradient update complete"
+        )
 
     def _on_step(self) -> bool:
         # Pull step data from SB3 locals (set by on_policy_algorithm.py)
@@ -120,6 +134,11 @@ class TrainingMonitorCallback(BaseCallback):
             )
             max_speed = max(self._ep_speeds) if self._ep_speeds else 0.0
 
+            # Rollout progress (steps collected toward next gradient update)
+            n_steps = getattr(self.model, "n_steps", 2048)
+            rollout_pos = self.num_timesteps % n_steps
+            rollout_remaining = n_steps - rollout_pos if rollout_pos > 0 else 0
+
             print(
                 f"[ep {self._ep_count:4d}]"
                 f"  {elapsed:6.1f}s"
@@ -129,6 +148,7 @@ class TrainingMonitorCallback(BaseCallback):
                 f"  max={max_speed:5.0f} km/h"
                 f"  dist={self._ep_max_dist:6.0f}m"
                 f"  reason={self._last_reason or 'truncated'}"
+                f"  [{rollout_remaining:4d} to update]"
             )
 
             # Reset for next episode
