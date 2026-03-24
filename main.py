@@ -410,10 +410,12 @@ def _run_calibrate(args: argparse.Namespace, iso: Path) -> None:
 
             # Save to calibration file
             CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            cal_data = {
-                "speed_addr": f"0x{speed_addr:08X}",
-                **{k: (f"0x{v:08X}" if isinstance(v, int) else v) for k, v in layout.items()},
-            }
+            cal_data = {}
+            for k, v in layout.items():
+                if isinstance(v, int):
+                    cal_data[k] = f"0x{v:08X}"
+                else:
+                    cal_data[k] = v
             with open(CALIBRATION_FILE, "w") as f:
                 json.dump(cal_data, f, indent=2)
             print(f"[calibrate] Saved to {CALIBRATION_FILE}")
@@ -447,32 +449,51 @@ def _probe_struct_layout(
     from evdev import ecodes as e
 
     PROBE_RANGE = 0x200  # bytes before and after speed_addr
-    start = max(0, speed_addr - PROBE_RANGE)
+    start = max(0, (speed_addr - PROBE_RANGE) & ~3)  # align to 4-byte boundary
     end = speed_addr + PROBE_RANGE
-    n_floats = (end - start) // 4
+    region_size = end - start
 
-    def _read_region() -> list[tuple[int, float]]:
-        vals = []
-        for i in range(n_floats):
-            addr = start + i * 4
-            try:
-                vals.append((addr, reader._read_f32(addr)))
-            except (RuntimeError, OSError):
-                vals.append((addr, float("nan")))
-        return vals
+    def _read_region() -> dict[int, float]:
+        """Read the probe region as Float32 values using bulk read."""
+        try:
+            raw = reader._pine.read_bulk(start, region_size)
+            vals = {}
+            for i in range(0, region_size, 4):
+                addr = start + i
+                vals[addr] = st.unpack_from("<f", raw, i)[0]
+            return vals
+        except (RuntimeError, OSError):
+            # Fallback to individual reads
+            vals = {}
+            for i in range(0, region_size, 4):
+                addr = start + i
+                try:
+                    vals[addr] = reader._read_f32(addr)
+                except (RuntimeError, OSError):
+                    vals[addr] = float("nan")
+            return vals
 
     def _read_region_i32() -> dict[int, int]:
-        vals = {}
-        for i in range(n_floats):
-            addr = start + i * 4
-            try:
-                vals[addr] = reader._read_i32(addr)
-            except (RuntimeError, OSError):
-                pass
-        return vals
+        """Read the probe region as Int32 values using bulk read."""
+        try:
+            raw = reader._pine.read_bulk(start, region_size)
+            vals = {}
+            for i in range(0, region_size, 4):
+                addr = start + i
+                vals[addr] = st.unpack_from("<i", raw, i)[0]
+            return vals
+        except (RuntimeError, OSError):
+            vals = {}
+            for i in range(0, region_size, 4):
+                addr = start + i
+                try:
+                    vals[addr] = reader._read_i32(addr)
+                except (RuntimeError, OSError):
+                    pass
+            return vals
 
     # Read while stopped
-    stopped_vals = dict(_read_region())
+    stopped_vals = _read_region()
     stopped_ints = _read_region_i32()
 
     # Accelerate for 3s then read again
@@ -480,12 +501,12 @@ def _probe_struct_layout(
     gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
     time.sleep(3.0)
 
-    moving_vals = dict(_read_region())
+    moving_vals = _read_region()
     moving_ints = _read_region_i32()
 
     # Wait a moment and read a third time to detect position (still changing)
     time.sleep(1.0)
-    moving2_vals = dict(_read_region())
+    moving2_vals = _read_region()
 
     gamepad.release_button(e.BTN_SOUTH)
     gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
