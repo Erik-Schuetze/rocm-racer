@@ -46,10 +46,10 @@ class InstanceConfig:
 
 # Directories in ~/.config/PCSX2 that should be symlinked (shared, read-only-ish)
 _SYMLINK_DIRS = ["bios", "cache", "inputprofiles", "cheats", "covers", "patches",
-                 "resources", "textures", "shaders"]
+                 "resources", "textures", "shaders", "sstates"]
 
 # Directories that must be per-instance (written at runtime)
-_INSTANCE_DIRS = ["savestates", "logs", "sstates", "snaps"]
+_INSTANCE_DIRS = ["savestates", "logs", "snaps"]
 
 
 class InstanceManager:

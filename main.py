@@ -1229,9 +1229,10 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             pcsx2_proc.terminate()
             sys.exit(1)
 
-        print("[train] Saving initial state to slot 0 for episode resets...")
-        reader.save_state(0)
-        time.sleep(0.5)
+        if not discovered:
+            print("[train] Saving initial state to slot 0 for episode resets...")
+            reader.save_state(0)
+            time.sleep(0.5)
         readers.append(reader)
 
         fc = FrameCapture(FrameCaptureConfig())
@@ -1283,9 +1284,11 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
                 instance_mgr.cleanup()
                 sys.exit(1)
 
-            print(f"[instance-{i}] Saving initial state to slot 0...")
-            reader.save_state(0)
-            time.sleep(0.5)
+            if not discovered:
+                # No pre-populated slots — save the boot state as the single slot 0
+                print(f"[instance-{i}] Saving initial state to slot 0...")
+                reader.save_state(0)
+                time.sleep(0.5)
             readers.append(reader)
 
             # 4. Frame capture — create but don't open yet (windows not tiled)
