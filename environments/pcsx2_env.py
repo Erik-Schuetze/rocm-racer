@@ -43,7 +43,8 @@ class PCSX2EnvConfig:
     savestate_settle_s: float = 1.0  # wait time after load_state() before reading
     # Termination thresholds
     stuck_speed_threshold_kph: float = 3.0
-    stuck_timeout_s: float = 2.0     # no grace — should never be at 0 km/h for 2s
+    stuck_timeout_s: float = 2.0     # at 0 km/h for 2s after grace → stuck
+    stuck_grace_s: float = 3.0       # ignore stuck for first N seconds (time to accelerate)
     slow_speed_threshold_kph: float = 15.0
     slow_speed_timeout_s: float = 5.0
     slow_speed_grace_s: float = 5.0  # ignore slow speed for first N seconds (acceleration time)
@@ -201,19 +202,20 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         terminated_reason = ""
         episode_time = self._episode_steps * self.config.step_interval_seconds
 
-        # Stuck detection (no grace period — should never sit at ~0 km/h)
-        if telemetry.speed_kph < self.config.stuck_speed_threshold_kph:
-            self._stuck_elapsed += self.config.step_interval_seconds
-        else:
-            self._stuck_elapsed = 0.0
-        if self._stuck_elapsed >= self.config.stuck_timeout_s:
-            terminated = True
-            terminated_reason = "stuck"
-            stuck_penalty = (
-                self.config.reward.stuck_penalty_base
-                + self.config.reward.stuck_penalty_per_100m * (distance / 100.0)
-            )
-            reward_terms["stuck"] = stuck_penalty
+        # Stuck detection (only after grace period for initial acceleration)
+        if episode_time > self.config.stuck_grace_s:
+            if telemetry.speed_kph < self.config.stuck_speed_threshold_kph:
+                self._stuck_elapsed += self.config.step_interval_seconds
+            else:
+                self._stuck_elapsed = 0.0
+            if self._stuck_elapsed >= self.config.stuck_timeout_s:
+                terminated = True
+                terminated_reason = "stuck"
+                stuck_penalty = (
+                    self.config.reward.stuck_penalty_base
+                    + self.config.reward.stuck_penalty_per_100m * (distance / 100.0)
+                )
+                reward_terms["stuck"] = stuck_penalty
 
         # Slow-speed timeout (only after grace period for initial acceleration)
         if not terminated and episode_time > self.config.slow_speed_grace_s:
