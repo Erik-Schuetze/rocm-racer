@@ -140,6 +140,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         # Reload a randomly-chosen savestate for a clean episode
         slot = random.choice(self.config.savestate_slots)
         self.memory_reader.load_state(slot)
+        self.memory_reader.set_slot(slot)
         self.sleep_fn(self.config.savestate_settle_s)
 
         # Reset all episode tracking state

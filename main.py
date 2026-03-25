@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-launch", action="store_true",
                         help="Skip launching PCSX2 (assume it is already running)")
     parser.add_argument("--calibrate", action="store_true",
-                        help="Automatically find the vehicle struct address (launches PCSX2)")
+                        help="(Deprecated — use --init) Single-savestate calibration for debugging")
 
     # Telemetry modes
     parser.add_argument("--telemetry", action="store_true",
@@ -232,7 +232,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-model", type=Path, default=None, metavar="PATH",
                         help="Load a saved model (.zip) and resume training from it")
     parser.add_argument("--setup-savestates", action="store_true",
-                        help="Load each highway-N.p2s file into PINE slots 0–9 for multi-start training")
+                        help="(Deprecated — use --init) Load highway-N.p2s files into PINE slots")
+    parser.add_argument("--init", action="store_true",
+                        help="Discover savestates, calibrate per-slot memory addresses, and save PINE slots")
     return parser.parse_args()
 
 
@@ -282,7 +284,14 @@ def main() -> None:
 
     # --- Setup savestates: load .p2s files into PINE slots ---
     if args.setup_savestates:
-        _run_setup_savestates(args, iso)
+        print("[rocm-racer] --setup-savestates is deprecated. Use --init instead.")
+        print("[rocm-racer] Running --init automatically...")
+        _run_init(args, iso)
+        return
+
+    # --- Init mode: calibrate all savestates + load into PINE slots ---
+    if args.init:
+        _run_init(args, iso)
         return
 
     # --- Default: test mode (gamepad accelerate) ---
@@ -1161,6 +1170,225 @@ def _run_setup_savestates(args: argparse.Namespace, iso: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mode: --init  (unified calibrate + setup savestates)
+# ---------------------------------------------------------------------------
+
+def _run_init(args: argparse.Namespace, iso: Path) -> None:
+    """Unified initialisation: discover savestates, calibrate per-slot, save PINE slots.
+
+    For each highway-N.p2s file (N=0..9):
+      1. Launch PCSX2 with the .p2s file
+      2. Wait for the emulator to become ready
+      3. Take a stopped-state snapshot
+      4. Accelerate for 3 seconds (same as --calibrate Phase 1)
+      5. Take a moving-state snapshot
+      6. Differential scan → find the speed address for this slot
+      7. Save the emulator state to PINE slot N
+      8. Terminate PCSX2
+
+    Saves per-slot struct bases + offsets to calibration.json.
+    """
+    from memory_readers.nfsu2_memory import NFSU2MemoryReader
+    from memory_readers.virtual_gamepad import VirtualGamepad
+    from evdev import ecodes as e
+
+    ACCEL_TIME = 3.0
+
+    saves = _discover_savestate_files()
+    if not saves:
+        print("[init] No savestates found.")
+        print(f"  Place files named rocm-racer-nfsu2-highway-0.p2s … "
+              f"rocm-racer-nfsu2-highway-9.p2s in {SAVESTATES_DIR}")
+        return
+
+    print("[init] ══════════════════════════════════════════════════════════")
+    print("[init]  Unified init — per-slot calibration + PINE slot setup")
+    print("[init] ══════════════════════════════════════════════════════════")
+    print(f"[init] Found {len(saves)} savestate(s): {[s for s, _ in saves]}")
+
+    write_controller_db()
+    gamepad = VirtualGamepad()
+    gamepad.open()
+
+    slot_bases: dict[int, int] = {}
+    speed_unit: str = "unknown"
+    failed_slots: list[int] = []
+
+    for slot, save_path in saves:
+        print(f"\n[init] ── Slot {slot}: {save_path.name} ──")
+
+        # 1. Launch PCSX2 with this savestate
+        proc = launch_pcsx2(iso, statefile=save_path, turbo=False)
+        wait_for_pcsx2_ready()
+
+        reader = NFSU2MemoryReader()
+        reader.open()
+
+        try:
+            # 2. Take stopped-state snapshot
+            print(f"[init]   Snapshot A (stopped)...")
+            snap_stopped = reader.snapshot_ee_ram()
+
+            # 3. Accelerate for ACCEL_TIME seconds
+            print(f"[init]   Accelerating for {ACCEL_TIME}s...")
+            gamepad.hold_button(e.BTN_SOUTH)
+            gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+            time.sleep(ACCEL_TIME)
+
+            # 4. Take moving-state snapshot
+            print(f"[init]   Snapshot B (moving)...")
+            snap_moving = reader.snapshot_ee_ram()
+            gamepad.release_button(e.BTN_SOUTH)
+            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+
+            # 5. Differential scan — find speed candidates
+            speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_moving)
+            print(f"[init]   Phase 1: {len(speed_candidates):,} speed-float candidates")
+
+            if not speed_candidates:
+                print(f"[init]   ⚠  No speed candidates found for slot {slot} — skipping")
+                failed_slots.append(slot)
+            else:
+                # 6. Pick the best candidate using position validation
+                best = _pick_best_speed_candidate(
+                    snap_stopped, snap_moving, speed_candidates,
+                )
+                if best is None:
+                    print(f"[init]   ⚠  No valid candidate for slot {slot} — skipping")
+                    failed_slots.append(slot)
+                else:
+                    best_addr, best_val, best_unit = best
+                    struct_base = best_addr - NFSU2MemoryReader.STRUCT_OFFSETS["speed"]
+                    slot_bases[slot] = struct_base
+                    if speed_unit != "unknown" and best_unit != speed_unit:
+                        print(f"[init]   ⚠  Unit mismatch: slot {slot} reports "
+                              f"{best_unit}, previous slots used {speed_unit}")
+                    speed_unit = best_unit
+                    print(f"[init]   ✓ Speed @ 0x{best_addr:08X} "
+                          f"({best_val:.2f} {best_unit}), "
+                          f"struct base = 0x{struct_base:08X}")
+
+                    # 7. Save emulator state to PINE slot (only if calibration succeeded)
+                    reader.save_state(slot)
+                    time.sleep(0.5)
+                    print(f"[init]   ✓ Saved to PINE slot {slot}")
+
+        finally:
+            reader.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+            time.sleep(1.0)
+
+    gamepad.close()
+
+    # ── Save calibration.json ──
+    if not slot_bases:
+        print("\n[init] ERROR: No slots were successfully calibrated.")
+        return
+
+    cal_data = {
+        "speed_unit": speed_unit,
+        "struct_offsets": NFSU2MemoryReader.STRUCT_OFFSETS,
+        "slot_addresses": {
+            str(slot): f"0x{base:08X}" for slot, base in sorted(slot_bases.items())
+        },
+    }
+
+    CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(cal_data, f, indent=2)
+
+    print(f"\n[init] ══════════════════════════════════════════════════════════")
+    print(f"[init]  Results:")
+    print(f"[init]    Calibrated: {sorted(slot_bases.keys())}")
+    if failed_slots:
+        print(f"[init]    Failed:     {failed_slots}")
+    print(f"[init]    Saved to:   {CALIBRATION_FILE}")
+    print(f"[init] ══════════════════════════════════════════════════════════")
+    print(f"[init] Run training with:  python main.py --train")
+
+
+def _pick_best_speed_candidate(
+    snap_stopped: bytes,
+    snap_moving: bytes,
+    candidates: list[tuple[int, float, str]],
+) -> tuple[int, float, str] | None:
+    """Score speed candidates using position validation and return the best.
+
+    For each candidate speed address, checks if the address at offset -0x10
+    (expected position) contains valid world coordinates that changed between
+    snapshots (the car moved).
+
+    Returns (speed_addr, speed_val, unit) or None if no valid candidate.
+    """
+    from memory_readers.nfsu2_memory import NFSU2MemoryReader
+
+    f32_s = np.frombuffer(snap_stopped, dtype=np.float32)
+    f32_m = np.frombuffer(snap_moving, dtype=np.float32)
+
+    scored: list[tuple[float, int, float, str]] = []
+
+    for speed_addr, speed_val, unit in candidates:
+        score = 0.0
+        off = NFSU2MemoryReader.STRUCT_OFFSETS
+        struct_base = speed_addr - off["speed"]
+
+        if struct_base < 0x00100000:
+            continue
+
+        # Check position at struct_base + pos offsets
+        pos_addrs = (
+            struct_base + off["pos_x"],
+            struct_base + off["pos_y"],
+            struct_base + off["pos_z"],
+        )
+
+        pos_valid = True
+        pos_moved = 0.0
+        for pa in pos_addrs:
+            idx = pa // 4
+            if idx >= len(f32_s) or idx >= len(f32_m):
+                pos_valid = False
+                break
+            vs = float(f32_s[idx])
+            vm = float(f32_m[idx])
+            if not (np.isfinite(vs) and np.isfinite(vm)):
+                pos_valid = False
+                break
+            # World coordinates should have reasonable magnitude
+            if abs(vs) > 200_000 or abs(vm) > 200_000:
+                pos_valid = False
+                break
+            pos_moved += abs(vm - vs)
+
+        if not pos_valid:
+            continue
+
+        # Position should have moved (car drove forward)
+        if pos_moved < 1.0:
+            continue
+
+        # Score: position movement + heap region bonus + position magnitude bonus
+        score += min(pos_moved, 200.0)
+        if speed_addr >= 0x00300000:
+            score += 50.0
+        # Prefer positions with non-trivial coordinates (not near origin)
+        for pa in pos_addrs:
+            idx = pa // 4
+            if abs(float(f32_s[idx])) > 10.0:
+                score += 10.0
+
+        scored.append((score, speed_addr, speed_val, unit))
+
+    if not scored:
+        return None
+
+    scored.sort(reverse=True)
+    _, best_addr, best_val, best_unit = scored[0]
+    return (best_addr, best_val, best_unit)
+
+
+# ---------------------------------------------------------------------------
 # Mode: --train
 # ---------------------------------------------------------------------------
 
@@ -1199,7 +1427,6 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     if discovered:
         savestate_slots = tuple(s for s, _ in discovered)
         print(f"[train] Multi-start: {len(discovered)} savestates (slots {list(savestate_slots)})")
-        print(f"[train]   Run --setup-savestates first if PINE slots are not yet populated.")
     else:
         # No extra saves — fall back to slot 0 (the default highway save
         # loaded at PCSX2 boot, saved to slot 0 below).
@@ -1222,12 +1449,28 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         if not reader.is_calibrated():
             print(
                 "[rocm-racer] ERROR: No calibration data found.\n"
-                "  Run:  python main.py --calibrate",
+                "  Run:  python main.py --init",
                 file=sys.stderr,
             )
             gamepad.close()
             pcsx2_proc.terminate()
             sys.exit(1)
+
+        # Filter savestate slots to only those with calibration data
+        if reader.has_slot_calibration():
+            cal_slots = reader.calibrated_slots()
+            savestate_slots = tuple(s for s in savestate_slots if s in cal_slots)
+            if not savestate_slots:
+                print(
+                    "[train] ERROR: No savestate slots have calibration data.\n"
+                    "  Run:  python main.py --init",
+                    file=sys.stderr,
+                )
+                gamepad.close()
+                pcsx2_proc.terminate()
+                sys.exit(1)
+            print(f"[train] Using calibrated slots: {list(savestate_slots)}")
+            env_config = PCSX2EnvConfig(device=args.device, savestate_slots=savestate_slots)
 
         if not discovered:
             print("[train] Saving initial state to slot 0 for episode resets...")
@@ -1278,7 +1521,7 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
             reader.open()
             if not reader.is_calibrated():
                 print(
-                    f"[instance-{i}] ERROR: No calibration data. Run --calibrate first.",
+                    f"[instance-{i}] ERROR: No calibration data. Run --init first.",
                     file=sys.stderr,
                 )
                 instance_mgr.cleanup()

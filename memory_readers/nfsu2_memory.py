@@ -109,6 +109,12 @@ class NFSU2MemoryReader:
         __import__("pathlib").Path(__file__).parent.parent / "saves" / "calibration.json"
     )
 
+    # Struct member offsets (constant across savestates — only the base moves)
+    STRUCT_OFFSETS = {
+        "pos_x": 0x00, "pos_y": 0x04, "pos_z": 0x08,
+        "speed": 0x10,
+    }
+
     def __init__(
         self,
         offsets: TelemetryOffsets | None = None,
@@ -129,6 +135,9 @@ class NFSU2MemoryReader:
         self._vel_addrs: tuple[int, int, int] = (0, 0, 0)
         self._rot_addrs: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._speed_unit: str = "unknown"
+        # Per-slot calibration: slot → struct base address
+        self._slot_bases: dict[int, int] = {}
+        self._active_slot: int | None = None
 
     # ----- lifecycle -----
 
@@ -142,7 +151,12 @@ class NFSU2MemoryReader:
         self._load_calibration()
 
     def _load_calibration(self) -> None:
-        """Load discovered absolute addresses from calibration.json if present."""
+        """Load discovered addresses from calibration.json.
+
+        Supports two formats:
+        - New per-slot format: ``slot_addresses`` dict mapping slot → struct base
+        - Legacy flat format: ``speed_addr``, ``pos_x_addr``, etc. (single-slot)
+        """
         import json
         if not self._cal_file.exists():
             return
@@ -154,43 +168,46 @@ class NFSU2MemoryReader:
                 val = cal.get(key, default)
                 return int(val, 0) if isinstance(val, str) else int(val)
 
-            # Speed address (absolute PS2 address)
-            if "speed_addr" in cal:
-                self._speed_addr = _hex("speed_addr")
             if "speed_unit" in cal:
                 self._speed_unit = cal["speed_unit"]
 
-            # Position addresses (absolute)
+            # ── New per-slot format ──
+            if "slot_addresses" in cal:
+                for slot_str, base_hex in cal["slot_addresses"].items():
+                    slot = int(slot_str)
+                    base = int(base_hex, 0) if isinstance(base_hex, str) else int(base_hex)
+                    self._slot_bases[slot] = base
+
+                # Activate the first available slot so is_calibrated() returns True
+                if self._slot_bases:
+                    first_slot = min(self._slot_bases)
+                    self.set_slot(first_slot)
+
+                print(f"[rocm-racer] Calibration loaded: {len(self._slot_bases)} slots "
+                      f"from {self._cal_file}")
+                return
+
+            # ── Legacy flat format (backward compat) ──
+            if "speed_addr" in cal:
+                self._speed_addr = _hex("speed_addr")
+
             if all(k in cal for k in ("pos_x_addr", "pos_y_addr", "pos_z_addr")):
                 self._pos_addrs = (
                     _hex("pos_x_addr"), _hex("pos_y_addr"), _hex("pos_z_addr")
                 )
 
-            # Velocity addresses (absolute)
             if all(k in cal for k in ("vel_x_addr", "vel_y_addr", "vel_z_addr")):
                 self._vel_addrs = (
                     _hex("vel_x_addr"), _hex("vel_y_addr"), _hex("vel_z_addr")
                 )
 
-            # Rotation quaternion addresses (absolute)
             if all(k in cal for k in ("rot_x_addr", "rot_y_addr", "rot_z_addr", "rot_w_addr")):
                 self._rot_addrs = (
                     _hex("rot_x_addr"), _hex("rot_y_addr"),
                     _hex("rot_z_addr"), _hex("rot_w_addr")
                 )
 
-            # Static pointer (for dynamic struct relocation)
-            if "static_pointer_addr" in cal:
-                self.offsets = TelemetryOffsets(
-                    static_pointer_addr=_hex("static_pointer_addr"),
-                    vehicle_struct_addr=_hex("speed_addr", 0),
-                )
-            elif "speed_addr" in cal:
-                self.offsets = TelemetryOffsets(
-                    vehicle_struct_addr=_hex("speed_addr"),
-                )
-
-            print(f"[rocm-racer] Calibration loaded from {self._cal_file}")
+            print(f"[rocm-racer] Calibration loaded (legacy format) from {self._cal_file}")
         except Exception as exc:
             print(f"[rocm-racer] Warning: could not load calibration: {exc}")
 
@@ -224,12 +241,41 @@ class NFSU2MemoryReader:
         else:
             raise RuntimeError(
                 "Vehicle struct address is uncalibrated.\n"
-                "Run:  python main.py --calibrate"
+                "Run:  python main.py --init"
             )
 
     def is_calibrated(self) -> bool:
         """Return True if speed address is known (minimum viable calibration)."""
         return self._speed_addr != 0
+
+    def set_slot(self, slot: int) -> None:
+        """Switch telemetry addresses to match the given savestate slot.
+
+        Uses the per-slot struct base from calibration.json to recalculate
+        absolute addresses for speed and position.  Must be called after
+        ``load_state(slot)`` to ensure telemetry reads the correct memory.
+
+        Falls back silently if per-slot data is unavailable (legacy calibration).
+        """
+        if slot not in self._slot_bases:
+            return
+        base = self._slot_bases[slot]
+        off = self.STRUCT_OFFSETS
+        self._speed_addr = base + off["speed"]
+        self._pos_addrs = (
+            base + off["pos_x"],
+            base + off["pos_y"],
+            base + off["pos_z"],
+        )
+        self._active_slot = slot
+
+    def has_slot_calibration(self) -> bool:
+        """Return True if per-slot addresses are available."""
+        return len(self._slot_bases) > 0
+
+    def calibrated_slots(self) -> list[int]:
+        """Return sorted list of slot numbers with calibration data."""
+        return sorted(self._slot_bases.keys())
 
     def save_state(self, slot: int = 0) -> None:
         """Save current emulator state to slot (0-9) via PINE IPC."""
@@ -246,7 +292,7 @@ class NFSU2MemoryReader:
         if not self.is_calibrated():
             raise RuntimeError(
                 "Vehicle struct address is uncalibrated.\n"
-                "Run:  python main.py --calibrate"
+                "Run:  python main.py --init"
             )
         speed_raw = self._read_f32(self._speed_addr)
         if self._speed_unit == "km/h":
