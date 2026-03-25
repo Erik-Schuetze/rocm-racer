@@ -4,6 +4,8 @@ Training observability for rocm-racer PPO training.
 TrainingMonitorCallback provides:
   - One log line per completed episode with key statistics
   - Live OpenCV preview window showing what the model sees + its current action
+  - Freeze/resume of all envs around gradient updates (prevents free-distance bug)
+  - Curriculum distance escalation (auto-raise success_distance_m)
 
 Episode log format:
   [ep  42] 47.3s  182 steps  R=+34.2  avg=72 km/h  max=115 km/h  dist=312m  reason=crash
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from typing import Any
 
 # OpenCV ships its own Qt that only has the XCB (X11) plugin.
@@ -54,6 +57,11 @@ class TrainingMonitorCallback(BaseCallback):
         preview_scale: int = 4,
         preview_interval: int = 5,
         verbose: int = 0,
+        # Curriculum settings
+        initial_goal_m: float = 500.0,
+        goal_increment_m: float = 500.0,
+        promotion_rate: float = 0.50,
+        curriculum_window_size: int = 50,
     ) -> None:
         super().__init__(verbose)
         self._preview = preview
@@ -75,6 +83,12 @@ class TrainingMonitorCallback(BaseCallback):
         # Current action (updated each step for the preview overlay)
         self._last_action: np.ndarray = np.zeros(2, dtype=np.float32)
 
+        # Curriculum distance escalation
+        self._current_goal: float = initial_goal_m
+        self._goal_increment: float = goal_increment_m
+        self._promotion_rate: float = promotion_rate
+        self._curriculum_window: deque[bool] = deque(maxlen=curriculum_window_size)
+
     # ── SB3 lifecycle ─────────────────────────────────────────────────────
 
     def _on_training_start(self) -> None:
@@ -90,6 +104,9 @@ class TrainingMonitorCallback(BaseCallback):
         n_steps = getattr(self.model, "n_steps", "?")
         rollout_total = f"{n_steps} × {self._num_envs} = {n_steps * self._num_envs}" if self._num_envs > 1 else str(n_steps)
         print(f"[monitor] Rollout size: {rollout_total} steps per gradient update")
+        print(f"[monitor] Curriculum: goal={self._current_goal:.0f}m, "
+              f"increment={self._goal_increment:.0f}m, "
+              f"promotion at {self._promotion_rate:.0%} over {self._curriculum_window.maxlen} eps")
         if self._preview:
             cv2.namedWindow("rocm-racer", cv2.WINDOW_NORMAL)
             cv2.resizeWindow(
@@ -98,13 +115,32 @@ class TrainingMonitorCallback(BaseCallback):
                 96 * self._preview_scale,
             )
 
+    def _on_rollout_start(self) -> None:
+        """Resume all envs after the gradient update completes.
+
+        Restores the pre-update savestate so any distance the emulators
+        drifted during the GPU compute phase is erased.
+
+        Skipped on the very first rollout (no freeze has occurred yet).
+        """
+        if self._update_count == 0:
+            return  # first rollout — nothing frozen yet
+        self.training_env.env_method("resume_after_update")
+
     def _on_rollout_end(self) -> None:
+        """Freeze all envs before the gradient update begins.
+
+        Zeros inputs and snapshots each emulator so they don't accumulate
+        free distance while the GPU is busy with the policy update.
+        """
+        self.training_env.env_method("freeze_for_update")
+
         self._update_count += 1
         total_ts = self.num_timesteps
         print(
             f"[update {self._update_count:3d}]"
             f"  {total_ts:,} total steps"
-            f"  — gradient update complete"
+            f"  — envs frozen, starting gradient update"
         )
 
     def _on_step(self) -> bool:
@@ -158,6 +194,7 @@ class TrainingMonitorCallback(BaseCallback):
                     f"  avg={avg_speed:5.0f} km/h"
                     f"  max={max_speed:5.0f} km/h"
                     f"  dist={self._ep_max_dist[env_i]:6.0f}m"
+                    f"  goal={self._current_goal:.0f}m"
                     f"  reason={self._last_reason[env_i] or 'truncated'}"
                     f"  [{rollout_remaining:4d} to update]"
                 )
@@ -168,6 +205,27 @@ class TrainingMonitorCallback(BaseCallback):
                 self._ep_speeds[env_i] = []
                 self._ep_max_dist[env_i] = 0.0
                 self._last_reason[env_i] = ""
+
+                # ── Curriculum distance escalation ────────────────────────
+                self._curriculum_window.append(reason == "success")
+
+                window_size = self._curriculum_window.maxlen
+                if (len(self._curriculum_window) >= window_size
+                        and sum(self._curriculum_window) / len(self._curriculum_window)
+                        >= self._promotion_rate):
+                    old_goal = self._current_goal
+                    self._current_goal += self._goal_increment
+                    rate = sum(self._curriculum_window) / len(self._curriculum_window)
+                    self._curriculum_window.clear()
+                    self.training_env.set_attr(
+                        "success_distance_m", self._current_goal
+                    )
+                    print(
+                        f"[curriculum] Goal promoted: {old_goal:.0f}m → "
+                        f"{self._current_goal:.0f}m "
+                        f"(success rate {rate:.0%} over "
+                        f"{window_size} eps)"
+                    )
 
         # Track env 0 action for preview overlay
         if actions is not None and len(actions) > 0:

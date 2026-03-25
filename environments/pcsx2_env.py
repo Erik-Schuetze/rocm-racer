@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -22,6 +23,7 @@ class RewardConfig:
     stuck_penalty: float = -10.0     # one-time penalty on stuck termination
     slow_timeout_penalty: float = -5.0  # one-time penalty on slow_timeout termination
     success_bonus: float = 50.0      # applied when distance > success_distance_m
+    steering_smoothness_weight: float = 0.005  # gentle penalty on frame-to-frame steering jitter
     milestone_rewards: tuple = (     # (distance_m, bonus) pairs, ascending
         (100.0, 2.0),
         (250.0, 5.0),
@@ -36,6 +38,7 @@ class PCSX2EnvConfig:
     device: str = "cuda"
     reward: RewardConfig = field(default_factory=RewardConfig)
     savestate_slot: int = 0
+    savestate_slots: tuple[int, ...] = (0,)  # slots to randomly pick from on reset
     savestate_settle_s: float = 1.0  # wait time after load_state() before reading
     # Termination thresholds
     stuck_speed_threshold_kph: float = 3.0
@@ -43,7 +46,13 @@ class PCSX2EnvConfig:
     slow_speed_threshold_kph: float = 15.0
     slow_speed_timeout_s: float = 5.0
     slow_speed_grace_s: float = 5.0  # ignore slow speed for first N seconds (acceleration time)
-    success_distance_m: float = 1000.0
+    success_distance_m: float = 500.0  # initial goal — raised by curriculum
+
+
+# Dedicated PINE save-state slot for freeze/resume during gradient updates.
+# Slot 0 is reserved for freeze/resume. Slots 1–9 are used for episode
+# resets (up to 9 starting positions via --setup-savestates).
+_FREEZE_SLOT = 0
 
 
 @dataclass(frozen=True)
@@ -108,6 +117,13 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps = 0
         self._last_telemetry: TelemetrySample | None = None
 
+        # Mutable success distance — shadowed from config so the curriculum
+        # callback can raise it at runtime without touching the frozen dataclass.
+        self.success_distance_m: float = self.config.success_distance_m
+
+        # Steering smoothness tracking
+        self._last_steering: float = 0.0
+
         # Episode state for termination tracking
         self._start_position: tuple[float, float, float] | None = None
         self._slow_speed_elapsed: float = 0.0
@@ -129,8 +145,9 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self.gamepad.open()
         self.gamepad.center()
 
-        # Reload savestate for a clean episode
-        self.memory_reader.load_state(self.config.savestate_slot)
+        # Reload a randomly-chosen savestate for a clean episode
+        slot = random.choice(self.config.savestate_slots)
+        self.memory_reader.load_state(slot)
         self.sleep_fn(self.config.savestate_settle_s)
 
         # Reset all episode tracking state
@@ -138,6 +155,7 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self._slow_speed_elapsed = 0.0
         self._stuck_elapsed = 0.0
         self._milestones_hit = set()
+        self._last_steering = 0.0
 
         self._last_telemetry = self.memory_reader.read_telemetry()
         self._start_position = self._last_telemetry.position
@@ -171,14 +189,28 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             "time": self.config.reward.time_penalty,
         }
 
+        # --- Steering smoothness penalty (gentle — max penalty is -0.01) ---
+        steering_delta = abs(control.steering - self._last_steering)
+        reward_terms["steering_smooth"] = (
+            -self.config.reward.steering_smoothness_weight * steering_delta
+        )
+        self._last_steering = control.steering
+
         # --- Distance from start ---
         distance = self._euclidean_distance(telemetry.position)
 
         # --- Milestone bonuses (one-time, ascending) ---
+        # Static milestones from config
         for milestone_dist, milestone_bonus in self.config.reward.milestone_rewards:
             if distance >= milestone_dist and milestone_dist not in self._milestones_hit:
                 self._milestones_hit.add(milestone_dist)
                 reward_terms[f"milestone_{int(milestone_dist)}m"] = milestone_bonus
+        # Dynamic milestones at 20%, 50%, 80% of current goal
+        for frac, bonus in ((0.20, 2.0), (0.50, 5.0), (0.80, 10.0)):
+            dyn_dist = self.success_distance_m * frac
+            if distance >= dyn_dist and dyn_dist not in self._milestones_hit:
+                self._milestones_hit.add(dyn_dist)
+                reward_terms[f"milestone_{int(dyn_dist)}m"] = bonus
 
         # --- Termination conditions ---
         terminated = False
@@ -206,8 +238,8 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
                 terminated_reason = "slow_timeout"
                 reward_terms["slow_timeout"] = self.config.reward.slow_timeout_penalty
 
-        # Success
-        if not terminated and distance >= self.config.success_distance_m:
+        # Success — uses mutable goal so curriculum callback can raise it
+        if not terminated and distance >= self.success_distance_m:
             terminated = True
             terminated_reason = "success"
             reward_terms["success"] = self.config.reward.success_bonus
@@ -227,6 +259,27 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self.memory_reader.close()
         if self.frame_capture is not None:
             self.frame_capture.close()
+
+    # ── gradient-update freeze / resume ───────────────────────────────────
+
+    def freeze_for_update(self) -> None:
+        """Zero all inputs and snapshot state before a gradient update.
+
+        Called by the training callback at rollout end so the emulator
+        doesn't keep running (accumulating free distance) while the GPU
+        computes the policy update.
+        """
+        self.gamepad.center()
+        self.memory_reader.save_state(_FREEZE_SLOT)
+
+    def resume_after_update(self) -> None:
+        """Restore the pre-update snapshot so no drift is counted.
+
+        Called by the training callback at rollout start, after the
+        gradient update is complete.
+        """
+        self.memory_reader.load_state(_FREEZE_SLOT)
+        self.sleep_fn(self.config.savestate_settle_s)
 
     # ── internals ─────────────────────────────────────────────────────────
 

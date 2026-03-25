@@ -231,6 +231,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of parallel PCSX2 environments (default: 1)")
     parser.add_argument("--load-model", type=Path, default=None, metavar="PATH",
                         help="Load a saved model (.zip) and resume training from it")
+    parser.add_argument("--setup-savestates", action="store_true",
+                        help="Load each highway-N.p2s file into PINE slots 0–5 for multi-start training")
     return parser.parse_args()
 
 
@@ -276,6 +278,11 @@ def main() -> None:
     # --- Training mode: PPO ---
     if args.train:
         _run_train(args, iso)
+        return
+
+    # --- Setup savestates: load .p2s files into PINE slots ---
+    if args.setup_savestates:
+        _run_setup_savestates(args, iso)
         return
 
     # --- Default: test mode (gamepad accelerate) ---
@@ -1085,6 +1092,78 @@ def _run_vision(args: argparse.Namespace, iso: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Multi-savestate helpers
+# ---------------------------------------------------------------------------
+
+def _discover_savestate_files() -> list[tuple[int, Path]]:
+    """Find highway savestate files matching rocm-racer-nfsu2-highway-N.p2s (N=1..9).
+
+    Returns a list of (slot, path) tuples sorted by slot.  The file suffix
+    matches the PINE slot directly: highway-1.p2s → slot 1, etc.
+    Slot 0 is reserved for freeze/resume during gradient updates.
+    """
+    found: list[tuple[int, Path]] = []
+    for slot in range(1, 10):
+        p = SAVESTATES_DIR / f"rocm-racer-nfsu2-highway-{slot}.p2s"
+        if p.exists():
+            found.append((slot, p))
+    return found
+
+
+def _run_setup_savestates(args: argparse.Namespace, iso: Path) -> None:
+    """One-time setup: load each highway-N.p2s file into PINE slot N.
+
+    PINE's load_state(slot) only works with in-emulator numbered slots, not
+    arbitrary .p2s files on disk.  This mode sequentially boots PCSX2 with
+    each .p2s file and saves it into the matching PINE slot.
+
+    Slot mapping (filename suffix = PINE slot):
+      highway-1.p2s → slot 1
+      highway-2.p2s → slot 2
+      ...
+      highway-9.p2s → slot 9
+
+    Slot 0 is reserved for freeze/resume during gradient updates.
+    After this, ``--train`` can use slots 1–9 for randomised episode starts.
+    """
+    from memory_readers.virtual_gamepad import VirtualGamepad
+
+    saves = _discover_savestate_files()
+    if not saves:
+        print("[setup-savestates] No savestates found.")
+        print(f"  Place files named rocm-racer-nfsu2-highway-1.p2s … "
+              f"rocm-racer-nfsu2-highway-9.p2s in {SAVESTATES_DIR}")
+        return
+
+    write_controller_db()
+    gamepad = VirtualGamepad()
+    gamepad.open()
+
+    from memory_readers.nfsu2_memory import NFSU2MemoryReader
+
+    for slot, save_path in saves:
+        print(f"[setup-savestates] Loading {save_path.name} into slot {slot}...")
+        proc = launch_pcsx2(iso, statefile=save_path, turbo=False)
+        wait_for_pcsx2_ready()
+        reader = NFSU2MemoryReader()
+        reader.open()
+        reader.save_state(slot)
+        time.sleep(0.5)
+        print(f"[setup-savestates] Slot {slot} saved.")
+        reader.close()
+        proc.terminate()
+        proc.wait(timeout=5)
+        time.sleep(1.0)
+
+    gamepad.close()
+
+    slots = [s for s, _ in saves]
+    print(f"\n[setup-savestates] Done — {len(saves)} savestates loaded into slots {slots}")
+    print(f"[setup-savestates] Slot 0 reserved for freeze/resume.")
+    print(f"[setup-savestates] Run training with:  python main.py --train")
+
+
+# ---------------------------------------------------------------------------
 # Mode: --train
 # ---------------------------------------------------------------------------
 
@@ -1118,7 +1197,20 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
 
     write_controller_db()
 
-    env_config = PCSX2EnvConfig(device=args.device)
+    # ── Detect available savestate slots ──────────────────────────────
+    # Slot 0 is reserved for freeze/resume. Episode-reset slots are 1–9.
+    discovered = _discover_savestate_files()
+    if discovered:
+        savestate_slots = tuple(s for s, _ in discovered)
+        print(f"[train] Multi-start: {len(discovered)} savestates (slots {list(savestate_slots)})")
+        print(f"[train]   Make sure you ran --setup-savestates first to populate PINE slots.")
+    else:
+        # No extra saves — fall back to slot 0 (the default highway save
+        # loaded at PCSX2 boot, saved to slot 0 below).
+        savestate_slots = (0,)
+        print("[train] Single start position (slot 0)")
+
+    env_config = PCSX2EnvConfig(device=args.device, savestate_slots=savestate_slots)
 
     if num_envs == 1:
         # ── Single-env path (original, no isolation overhead) ──────────
@@ -1245,6 +1337,10 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         preview=not args.no_preview,
         preview_scale=4,
         preview_interval=5,
+        initial_goal_m=env_config.success_distance_m,
+        goal_increment_m=500.0,
+        promotion_rate=0.50,
+        curriculum_window_size=50,
     )
 
     callbacks = CallbackList([checkpoint_cb, monitor_cb])

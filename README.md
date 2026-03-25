@@ -118,6 +118,24 @@ source venv/bin/activate
 python main.py
 ```
 
+### Training
+
+```bash
+# 1. Calibrate telemetry offsets (one-time, interactive)
+python main.py --calibrate
+
+# 2. (Optional) Create extra starting positions for multi-start training
+#    Place rocm-racer-nfsu2-highway-1.p2s … highway-9.p2s in savestates/
+#    then load them into PINE slots:
+python main.py --setup-savestates
+
+# 3. Run PPO training
+python main.py --train --timesteps 1000000
+
+# Resume from a checkpoint
+python main.py --train --load-model models/ppo_nfsu2_20260325_final.zip
+```
+
 Optional flags:
 
 | Flag | Default | Description |
@@ -125,18 +143,33 @@ Optional flags:
 | `--game` | `nfsu2` | Which game ISO to launch (`nfsu2` or `nfsmw`) |
 | `--statefile <path>` | `savestates/rocm-racer-nfsu2-highway.p2s` | Override the save state loaded at startup |
 | `--timesteps <n>` | `1000000` | Total PPO training timesteps |
-| `--tensorboard-log <dir>` | *(none)* | Directory for TensorBoard logs |
+| `--tensorboard-log <dir>` | `runs/` | Directory for TensorBoard logs |
 | `--no-launch` | *(off)* | Skip launching PCSX2 (assume it is already running) |
+| `--train` | *(off)* | Run PPO training loop |
+| `--calibrate` | *(off)* | Discover vehicle struct via differential scanning |
+| `--setup-savestates` | *(off)* | Load extra `.p2s` files into PINE slots for multi-start |
+| `--num-envs <n>` | `1` | Number of parallel PCSX2 environments |
+| `--turbo` | *(off)* | Run PCSX2 at 2× emulation speed |
+| `--load-model <path>` | *(none)* | Resume training from a saved model |
+| `--checkpoint-freq <n>` | `10000` | Save a model checkpoint every N timesteps |
+| `--device` | `cuda` | PyTorch device (`cuda`, `cpu`) |
+| `--no-preview` | *(off)* | Disable the live OpenCV preview window |
+
+## Training features
+
+- **Freeze/resume around gradient updates:** Environments are frozen (inputs zeroed, state saved to PINE slot 9) before each PPO gradient update and restored afterward, preventing the "free distance" bug where cars drift uncontrolled during GPU compute.
+- **Multi-savestate random starts:** Place up to 9 `.p2s` files in `savestates/` (named `rocm-racer-nfsu2-highway-1.p2s` through `9.p2s` — the suffix matches the PINE slot), run `--setup-savestates`, and each episode will randomly pick a starting position. PCSX2 has 10 quicksave slots (0–9); slot 0 is reserved for freeze/resume, leaving slots 1–9 for training starts.
+- **Steering smoothness reward:** A gentle per-step penalty (`-0.005 × |Δsteering|`) discourages jittery oscillation without penalizing legitimate swerving or stabilization.
+- **Curriculum distance escalation:** Training starts with a 500m success goal. When 50% of the last 50 episodes reach the goal, it is automatically raised by 500m (500 → 1000 → 1500 → …).
 
 ## Project status
 
-The repository currently contains:
+The agent is actively training on the NFSU2 highway loop using PPO with multimodal observations (96×96 grayscale frame stack + telemetry). Approximately 25% of runs reach the 1000m distance goal. The repository includes:
 
-- a Linux `/proc`-based memory reader scaffold for Underground 2 telemetry
-- a custom Gymnasium environment scaffold for PCSX2-driven RL
-
-The next major steps are:
-
-- calibrate real RAM offsets for Underground 2
-- wire emulator/controller input injection
-- add PPO and SAC training entrypoints
+- PINE IPC-based telemetry extraction with automated calibration (`--calibrate`)
+- Multimodal CNN+MLP feature extractor for SB3 PPO
+- Virtual gamepad (uinput) with SDL3 controller mapping
+- Frame capture via grim/hyprctl on Wayland
+- Multi-instance parallel training with `ThreadedVecEnv`
+- Curriculum learning with auto-escalating distance goals
+- Gradient-update freeze/resume to prevent free-distance reward bugs
