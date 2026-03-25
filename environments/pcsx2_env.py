@@ -47,13 +47,7 @@ class PCSX2EnvConfig:
     slow_speed_threshold_kph: float = 15.0
     slow_speed_timeout_s: float = 5.0
     slow_speed_grace_s: float = 5.0  # ignore slow speed for first N seconds (acceleration time)
-    success_distance_m: float = 500.0  # initial goal — raised by curriculum
-
-
-# Dedicated PINE save-state slot for freeze/resume during gradient updates.
-# Slot 0 is reserved for freeze/resume. Slots 1–9 are used for episode
-# resets (up to 9 starting positions via --setup-savestates).
-_FREEZE_SLOT = 0
+    success_distance_m: float = 1000.0
 
 
 @dataclass(frozen=True)
@@ -117,10 +111,6 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
 
         self._episode_steps = 0
         self._last_telemetry: TelemetrySample | None = None
-
-        # Mutable success distance — shadowed from config so the curriculum
-        # callback can raise it at runtime without touching the frozen dataclass.
-        self.success_distance_m: float = self.config.success_distance_m
 
         # Steering smoothness tracking
         self._last_steering: float = 0.0
@@ -206,13 +196,6 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
             if distance >= milestone_dist and milestone_dist not in self._milestones_hit:
                 self._milestones_hit.add(milestone_dist)
                 reward_terms[f"milestone_{int(milestone_dist)}m"] = milestone_bonus
-        # Dynamic milestones at 20%, 50%, 80% of current goal
-        for frac, bonus in ((0.20, 2.0), (0.50, 5.0), (0.80, 10.0)):
-            dyn_dist = self.success_distance_m * frac
-            if distance >= dyn_dist and dyn_dist not in self._milestones_hit:
-                self._milestones_hit.add(dyn_dist)
-                reward_terms[f"milestone_{int(dyn_dist)}m"] = bonus
-
         # --- Termination conditions ---
         terminated = False
         terminated_reason = ""
@@ -243,8 +226,8 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
                 terminated_reason = "slow_timeout"
                 reward_terms["slow_timeout"] = self.config.reward.slow_timeout_penalty
 
-        # Success — uses mutable goal so curriculum callback can raise it
-        if not terminated and distance >= self.success_distance_m:
+        # Success
+        if not terminated and distance >= self.config.success_distance_m:
             terminated = True
             terminated_reason = "success"
             reward_terms["success"] = self.config.reward.success_bonus
@@ -264,27 +247,6 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         self.memory_reader.close()
         if self.frame_capture is not None:
             self.frame_capture.close()
-
-    # ── gradient-update freeze / resume ───────────────────────────────────
-
-    def freeze_for_update(self) -> None:
-        """Zero all inputs and snapshot state before a gradient update.
-
-        Called by the training callback at rollout end so the emulator
-        doesn't keep running (accumulating free distance) while the GPU
-        computes the policy update.
-        """
-        self.gamepad.center()
-        self.memory_reader.save_state(_FREEZE_SLOT)
-
-    def resume_after_update(self) -> None:
-        """Restore the pre-update snapshot so no drift is counted.
-
-        Called by the training callback at rollout start, after the
-        gradient update is complete.
-        """
-        self.memory_reader.load_state(_FREEZE_SLOT)
-        self.sleep_fn(self.config.savestate_settle_s)
 
     # ── internals ─────────────────────────────────────────────────────────
 

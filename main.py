@@ -232,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-model", type=Path, default=None, metavar="PATH",
                         help="Load a saved model (.zip) and resume training from it")
     parser.add_argument("--setup-savestates", action="store_true",
-                        help="Load each highway-N.p2s file into PINE slots 0–5 for multi-start training")
+                        help="Load each highway-N.p2s file into PINE slots 0–9 for multi-start training")
     return parser.parse_args()
 
 
@@ -1096,14 +1096,13 @@ def _run_vision(args: argparse.Namespace, iso: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _discover_savestate_files() -> list[tuple[int, Path]]:
-    """Find highway savestate files matching rocm-racer-nfsu2-highway-N.p2s (N=1..9).
+    """Find highway savestate files matching rocm-racer-nfsu2-highway-N.p2s (N=0..9).
 
     Returns a list of (slot, path) tuples sorted by slot.  The file suffix
-    matches the PINE slot directly: highway-1.p2s → slot 1, etc.
-    Slot 0 is reserved for freeze/resume during gradient updates.
+    matches the PINE slot directly: highway-0.p2s → slot 0, etc.
     """
     found: list[tuple[int, Path]] = []
-    for slot in range(1, 10):
+    for slot in range(0, 10):
         p = SAVESTATES_DIR / f"rocm-racer-nfsu2-highway-{slot}.p2s"
         if p.exists():
             found.append((slot, p))
@@ -1118,13 +1117,12 @@ def _run_setup_savestates(args: argparse.Namespace, iso: Path) -> None:
     each .p2s file and saves it into the matching PINE slot.
 
     Slot mapping (filename suffix = PINE slot):
+      highway-0.p2s → slot 0
       highway-1.p2s → slot 1
-      highway-2.p2s → slot 2
       ...
       highway-9.p2s → slot 9
 
-    Slot 0 is reserved for freeze/resume during gradient updates.
-    After this, ``--train`` can use slots 1–9 for randomised episode starts.
+    After this, ``--train`` can use slots 0–9 for randomised episode starts.
     """
     from memory_readers.virtual_gamepad import VirtualGamepad
 
@@ -1159,7 +1157,6 @@ def _run_setup_savestates(args: argparse.Namespace, iso: Path) -> None:
 
     slots = [s for s, _ in saves]
     print(f"\n[setup-savestates] Done — {len(saves)} savestates loaded into slots {slots}")
-    print(f"[setup-savestates] Slot 0 reserved for freeze/resume.")
     print(f"[setup-savestates] Run training with:  python main.py --train")
 
 
@@ -1198,12 +1195,11 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
     write_controller_db()
 
     # ── Detect available savestate slots ──────────────────────────────
-    # Slot 0 is reserved for freeze/resume. Episode-reset slots are 1–9.
     discovered = _discover_savestate_files()
     if discovered:
         savestate_slots = tuple(s for s, _ in discovered)
         print(f"[train] Multi-start: {len(discovered)} savestates (slots {list(savestate_slots)})")
-        print(f"[train]   Make sure you ran --setup-savestates first to populate PINE slots.")
+        print(f"[train]   Run --setup-savestates first if PINE slots are not yet populated.")
     else:
         # No extra saves — fall back to slot 0 (the default highway save
         # loaded at PCSX2 boot, saved to slot 0 below).
@@ -1337,10 +1333,6 @@ def _run_train(args: argparse.Namespace, iso: Path) -> None:
         preview=not args.no_preview,
         preview_scale=4,
         preview_interval=5,
-        initial_goal_m=env_config.success_distance_m,
-        goal_increment_m=500.0,
-        promotion_rate=0.50,
-        curriculum_window_size=50,
     )
 
     callbacks = CallbackList([checkpoint_cb, monitor_cb])
