@@ -20,7 +20,8 @@ class RewardConfig:
     speed_weight: float = 0.02       # per-step: reward = min(speed, speed_cap) * speed_weight
     speed_cap_kph: float = 150.0     # cap speed reward — no incentive to exceed this
     time_penalty: float = -0.01      # per-step penalty to create urgency
-    stuck_penalty: float = -10.0     # one-time penalty on stuck termination
+    stuck_penalty_base: float = -5.0        # stuck penalty at 0m distance
+    stuck_penalty_per_100m: float = -5.0    # additional penalty per 100m covered
     slow_timeout_penalty: float = -5.0  # one-time penalty on slow_timeout termination
     success_bonus: float = 50.0      # applied when distance > success_distance_m
     steering_smoothness_weight: float = 0.005  # gentle penalty on frame-to-frame steering jitter
@@ -225,7 +226,11 @@ class PCSX2RacerEnv(gym.Env[np.ndarray, np.ndarray]):
         if self._stuck_elapsed >= self.config.stuck_timeout_s:
             terminated = True
             terminated_reason = "stuck"
-            reward_terms["stuck"] = self.config.reward.stuck_penalty
+            stuck_penalty = (
+                self.config.reward.stuck_penalty_base
+                + self.config.reward.stuck_penalty_per_100m * (distance / 100.0)
+            )
+            reward_terms["stuck"] = stuck_penalty
 
         # Slow-speed timeout (only after grace period for initial acceleration)
         if not terminated and episode_time > self.config.slow_speed_grace_s:
