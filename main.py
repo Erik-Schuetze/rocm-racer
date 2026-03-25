@@ -1193,6 +1193,8 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     ACCEL_TIME = 3.0
+    STEER_TIME = 0.4
+    STEER_SETTLE = 1.0
 
     saves = _discover_savestate_files()
     if not saves:
@@ -1229,29 +1231,40 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
             print(f"[init]   Snapshot A (stopped)...")
             snap_stopped = reader.snapshot_ee_ram()
 
-            # 3. Accelerate for ACCEL_TIME seconds
-            print(f"[init]   Accelerating for {ACCEL_TIME}s...")
+            # 3. Accelerate straight for ACCEL_TIME seconds
+            print(f"[init]   Accelerating straight for {ACCEL_TIME}s...")
             gamepad.hold_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(ACCEL_TIME)
 
-            # 4. Take moving-state snapshot
-            print(f"[init]   Snapshot B (moving)...")
-            snap_moving = reader.snapshot_ee_ram()
+            # 4. Take straight-moving snapshot
+            print(f"[init]   Snapshot B (moving straight)...")
+            snap_straight = reader.snapshot_ee_ram()
+
+            # 5. Gentle left steer while still accelerating
+            print(f"[init]   Gentle left steer ({STEER_TIME}s) + continued accel...")
+            gamepad.send(steering=-1.0, throttle=1.0, brake=0.0)
+            time.sleep(STEER_TIME)
+            gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+            time.sleep(STEER_SETTLE)
+
+            # 6. Take turned snapshot
+            print(f"[init]   Snapshot C (after steer)...")
+            snap_turned = reader.snapshot_ee_ram()
             gamepad.release_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-            # 5. Differential scan — find speed candidates
-            speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_moving)
+            # 7. Differential scan — find speed candidates
+            speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_straight)
             print(f"[init]   Phase 1: {len(speed_candidates):,} speed-float candidates")
 
             if not speed_candidates:
                 print(f"[init]   ⚠  No speed candidates found for slot {slot} — skipping")
                 failed_slots.append(slot)
             else:
-                # 6. Pick the best candidate using position validation
+                # 8. Pick the best candidate using position + turned-snapshot validation
                 best = _pick_best_speed_candidate(
-                    snap_stopped, snap_moving, speed_candidates,
+                    snap_stopped, snap_straight, snap_turned, speed_candidates,
                 )
                 if best is None:
                     print(f"[init]   ⚠  No valid candidate for slot {slot} — skipping")
@@ -1268,7 +1281,7 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
                           f"({best_val:.2f} {best_unit}), "
                           f"struct base = 0x{struct_base:08X}")
 
-                    # 7. Save emulator state to PINE slot (only if calibration succeeded)
+                    # 9. Save emulator state to PINE slot (only if calibration succeeded)
                     reader.save_state(slot)
                     time.sleep(0.5)
                     print(f"[init]   ✓ Saved to PINE slot {slot}")
@@ -1310,21 +1323,24 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
 
 def _pick_best_speed_candidate(
     snap_stopped: bytes,
-    snap_moving: bytes,
+    snap_straight: bytes,
+    snap_turned: bytes,
     candidates: list[tuple[int, float, str]],
 ) -> tuple[int, float, str] | None:
-    """Score speed candidates using position validation and return the best.
+    """Score speed candidates using position + steer validation and return the best.
 
-    For each candidate speed address, checks if the address at offset -0x10
-    (expected position) contains valid world coordinates that changed between
-    snapshots (the car moved).
+    Uses 3 snapshots (stopped → straight → turned) to distinguish true scalar
+    speed from velocity components. Scalar speed stays high after a direction
+    change; a velocity component drops.  Also validates that position coordinates
+    at the expected struct offset moved between snapshots.
 
     Returns (speed_addr, speed_val, unit) or None if no valid candidate.
     """
     from memory_readers.nfsu2_memory import NFSU2MemoryReader
 
     f32_s = np.frombuffer(snap_stopped, dtype=np.float32)
-    f32_m = np.frombuffer(snap_moving, dtype=np.float32)
+    f32_m = np.frombuffer(snap_straight, dtype=np.float32)
+    f32_t = np.frombuffer(snap_turned, dtype=np.float32)
 
     scored: list[tuple[float, int, float, str]] = []
 
@@ -1336,7 +1352,24 @@ def _pick_best_speed_candidate(
         if struct_base < 0x00100000:
             continue
 
-        # Check position at struct_base + pos offsets
+        # --- Turned-snapshot rejection ---
+        # True scalar speed should still be in a reasonable range after a
+        # direction change. Velocity components drop when direction changes.
+        turned_idx = speed_addr // 4
+        if turned_idx < len(f32_t):
+            turned_val = float(f32_t[turned_idx])
+            if unit == "m/s":
+                if not (10.0 <= turned_val <= 50.0):
+                    continue
+            else:
+                if not (40.0 <= turned_val <= 180.0):
+                    continue
+            # Bonus: value stayed close to straight-snapshot value (scalar ≈ scalar)
+            ratio = turned_val / speed_val if speed_val > 0 else 0
+            if 0.7 < ratio < 1.5:
+                score += 30.0
+
+        # --- Position validation ---
         pos_addrs = (
             struct_base + off["pos_x"],
             struct_base + off["pos_y"],
@@ -1355,7 +1388,6 @@ def _pick_best_speed_candidate(
             if not (np.isfinite(vs) and np.isfinite(vm)):
                 pos_valid = False
                 break
-            # World coordinates should have reasonable magnitude
             if abs(vs) > 200_000 or abs(vm) > 200_000:
                 pos_valid = False
                 break
@@ -1372,7 +1404,6 @@ def _pick_best_speed_candidate(
         score += min(pos_moved, 200.0)
         if speed_addr >= 0x00300000:
             score += 50.0
-        # Prefer positions with non-trivial coordinates (not near origin)
         for pa in pos_addrs:
             idx = pa // 4
             if abs(float(f32_s[idx])) > 10.0:
