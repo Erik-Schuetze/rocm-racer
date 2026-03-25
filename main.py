@@ -528,6 +528,7 @@ def _phase1_find_speed_candidates(
     data_stopped: bytes,
     data_moving: bytes,
     min_addr: int = 0x00100000,
+    data_stopped2: bytes | None = None,
 ) -> list[tuple[int, float, str]]:
     """Phase 1: find speed float via differential scan.
 
@@ -535,12 +536,19 @@ def _phase1_find_speed_candidates(
     either m/s range (15–35) or km/h range (75–110) while moving.
     Excludes addresses below min_addr (kernel/BIOS area).
 
+    If ``data_stopped2`` is provided (a second stopped snapshot taken after
+    a short delay), candidates must also be near zero in that snapshot.
+    This eliminates transient values that happened to be near zero once.
+
     Returns list of (ps2_addr, value_moving, unit_hint) tuples.
     """
     f32_s = np.frombuffer(data_stopped, dtype=np.float32)
     f32_m = np.frombuffer(data_moving, dtype=np.float32)
 
     near_zero    = np.isfinite(f32_s) & (np.abs(f32_s) < 0.5)
+    if data_stopped2 is not None:
+        f32_s2 = np.frombuffer(data_stopped2, dtype=np.float32)
+        near_zero = near_zero & np.isfinite(f32_s2) & (np.abs(f32_s2) < 0.5)
     in_ms_range  = np.isfinite(f32_m) & (f32_m >= 15.0) & (f32_m <= 35.0)
     in_kph_range = np.isfinite(f32_m) & (f32_m >= 60.0) & (f32_m <= 110.0)
 
@@ -1193,8 +1201,10 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
     from evdev import ecodes as e
 
     ACCEL_TIME = 3.0
-    STEER_TIME = 0.4
+    STEER_TIME = 0.1
     STEER_SETTLE = 1.0
+    VERIFY_TAP = 0.2    # brief accel tap before second stopped snapshot
+    VERIFY_COAST = 2.0  # coast to stop after tap
 
     saves = _discover_savestate_files()
     if not saves:
@@ -1227,42 +1237,57 @@ def _run_init(args: argparse.Namespace, iso: Path) -> None:
         reader.open()
 
         try:
-            # 2. Take stopped-state snapshot
-            print(f"[init]   Snapshot A (stopped)...")
+            # 2. Take first stopped-state snapshot
+            print(f"[init]   Snapshot A1 (stopped)...")
             snap_stopped = reader.snapshot_ee_ram()
 
-            # 3. Accelerate straight for ACCEL_TIME seconds
+            # 3. Brief accel tap + coast to verify speed returns to zero
+            print(f"[init]   Verify: accel tap {VERIFY_TAP}s → coast {VERIFY_COAST}s...")
+            gamepad.hold_button(e.BTN_SOUTH)
+            gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
+            time.sleep(VERIFY_TAP)
+            gamepad.release_button(e.BTN_SOUTH)
+            gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
+            time.sleep(VERIFY_COAST)
+
+            # 4. Take second stopped snapshot (speed should be ~0 again)
+            print(f"[init]   Snapshot A2 (stopped again after coast)...")
+            snap_stopped2 = reader.snapshot_ee_ram()
+
+            # 5. Accelerate straight for ACCEL_TIME seconds
             print(f"[init]   Accelerating straight for {ACCEL_TIME}s...")
             gamepad.hold_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(ACCEL_TIME)
 
-            # 4. Take straight-moving snapshot
+            # 6. Take straight-moving snapshot
             print(f"[init]   Snapshot B (moving straight)...")
             snap_straight = reader.snapshot_ee_ram()
 
-            # 5. Gentle left steer while still accelerating
+            # 7. Very gentle left steer while still accelerating
             print(f"[init]   Gentle left steer ({STEER_TIME}s) + continued accel...")
             gamepad.send(steering=-1.0, throttle=1.0, brake=0.0)
             time.sleep(STEER_TIME)
             gamepad.send(steering=0.0, throttle=1.0, brake=0.0)
             time.sleep(STEER_SETTLE)
 
-            # 6. Take turned snapshot
+            # 8. Take turned snapshot
             print(f"[init]   Snapshot C (after steer)...")
             snap_turned = reader.snapshot_ee_ram()
             gamepad.release_button(e.BTN_SOUTH)
             gamepad.send(steering=0.0, throttle=0.0, brake=0.0)
 
-            # 7. Differential scan — find speed candidates
-            speed_candidates = _phase1_find_speed_candidates(snap_stopped, snap_straight)
+            # 9. Differential scan — double-zero verified candidates
+            speed_candidates = _phase1_find_speed_candidates(
+                snap_stopped, snap_straight, data_stopped2=snap_stopped2,
+            )
             print(f"[init]   Phase 1: {len(speed_candidates):,} speed-float candidates")
 
             if not speed_candidates:
                 print(f"[init]   ⚠  No speed candidates found for slot {slot} — skipping")
                 failed_slots.append(slot)
             else:
-                # 8. Pick the best candidate using position + turned-snapshot validation
+                # 10. Pick the best candidate using position + turned-snapshot validation
                 best = _pick_best_speed_candidate(
                     snap_stopped, snap_straight, snap_turned, speed_candidates,
                 )
